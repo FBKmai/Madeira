@@ -2,7 +2,7 @@ name: Build IPA
 
 on:
   push:
-    branches: [main, 'codex/pr-build-*']
+    branches: [main, 'codex/pr-build-*', 'feat/duo-minimal']
   pull_request:
   workflow_dispatch:
 
@@ -27,6 +27,20 @@ jobs:
       ipaenv: ${{ steps.sdk.outputs.ipa }}
     steps:
       - uses: actions/checkout@v4
+      # A foldable iPhone's screen is new with the iOS 27 SDK. An IPA linked
+      # against an older SDK runs there in a compatibility canvas: iOS scales
+      # the whole app up, offers its zoom button and leaves wide black bars,
+      # whatever the app draws. v0.2.0's release IPA is such a build
+      # (LC_BUILD_VERSION sdk=26.5.0), made on a runner whose "xcode-27" label
+      # had Xcode 26.5 installed at the time. Stop here instead of shipping one.
+      - name: Check the iOS SDK knows this device's screen
+        run: |
+          sdk=$(xcrun --sdk iphoneos --show-sdk-version)
+          echo "iPhoneOS SDK $sdk"
+          if [ "$(printf '%s\n%s\n' 27.0 "$sdk" | sort -V | head -n 1)" != "27.0" ]; then
+            echo "::error::iPhoneOS SDK $sdk is older than 27.0, so this IPA would run on a foldable iPhone in a scaled compatibility canvas (zoom button, black bars). Install Xcode 27 on this runner."
+            exit 1
+          fi
       - name: Check build reuse rules
         run: |
           python3 tests/host/check-build-inputs.py
