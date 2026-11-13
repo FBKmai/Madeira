@@ -16,15 +16,21 @@ on the end of an edit, the default for new users only, and the session slot.
 Set SWIFTC if Swift is not on PATH.
 """
 from pathlib import Path
+import argparse
 import os
 import subprocess
 import tempfile
 
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--wiring-only', action='store_true',
+                    help='check source wiring only; explicitly skip Swift compilation/runtime tests')
+args = parser.parse_args()
+
 root = Path(__file__).resolve().parents[2]
 app = root / 'app/Madeira'
-content = (app / 'ContentView.swift').read_text()
-touch = (app / 'TouchGamepad.swift').read_text()
-presets = (app / 'TouchControlPresets.swift').read_text()
+content = (app / 'ContentView.swift').read_text(encoding='utf-8')
+touch = (app / 'TouchGamepad.swift').read_text(encoding='utf-8')
+presets = (app / 'TouchControlPresets.swift').read_text(encoding='utf-8')
 
 # ---------------------------------------------------------------- Part A
 actions = content[content.index('enum ControlAction: Codable'):content.index('final class TouchControlsModel')]
@@ -105,23 +111,129 @@ for (label, screen) in screens {
 let ids = Set(ControlPresetLayout.xbox(for: .referencePhone).map { $0.id })
 require(ids.count == expected.count, "built-in controls have distinct ids")
 
-// --- The Xbox controller preset as data: what a user is offered and what each button does.
+// --- The short-edge grip keeps the centre clear and works with real canvas shapes.
+let shortScreens: [(String, ControlPresetScreen)] = screens + [
+    ("unfolded wide", ControlPresetScreen(width: 1800, height: 700, left: 84, right: 52, bottom: 21)),
+    ("folded landscape", ControlPresetScreen(width: 874, height: 402, left: 59, right: 59, bottom: 21)),
+    ("compact landscape", ControlPresetScreen(width: 600, height: 390, left: 16, right: 20, bottom: 12)),
+    ("small landscape", ControlPresetScreen(width: 568, height: 320)),
+    ("short landscape", ControlPresetScreen(width: 600, height: 360)),
+    ("narrow portrait", ControlPresetScreen(width: 320, height: 568)),
+    ("near-square unfolded", ControlPresetScreen(width: 720, height: 700, left: 32, right: 48, top: 44, bottom: 34)),
+    ("square unfolded", ControlPresetScreen(width: 720, height: 720, top: 44, bottom: 34)),
+    ("portrait session", ControlPresetScreen(width: 402, height: 874, top: 62, bottom: 34)),
+    ("asymmetric safe area", ControlPresetScreen(width: 1366, height: 720, left: 84, right: 52, bottom: 21)),
+]
+let shortExpected = expected
+for (label, screen) in shortScreens {
+    let cs = ControlPresetLayout.shortEdge(for: screen)
+    let names = cs.compactMap { $0.action.padName }
+    require(cs.count == shortExpected.count && shortExpected.allSatisfy { n in names.filter { $0 == n }.count == 1 },
+            "\(label): short-edge grip binds all controller inputs once")
+    require(names.allSatisfy(TouchPadAction.supported), "\(label): short-edge mappings are XInput")
+    let left = max(ControlPresetLayout.margins(screen).left, screen.width * 0.03)
+    let right = max(ControlPresetLayout.margins(screen).right, screen.width * 0.03)
+    let top = max(ControlPresetLayout.margins(screen).top, screen.height * 0.03)
+    let bottom = max(ControlPresetLayout.margins(screen).bottom, screen.height * 0.03)
+    let safe = CGRect(x: left, y: top, width: screen.width - left - right,
+                      height: screen.height - top - bottom)
+    let boxes = cs.map { ControlPresetLayout.box($0, screen: screen) }
+    require(boxes.allSatisfy { safe.contains($0) }, "\(label): controls stay inside safe and drag bounds")
+    var overlaps: [String] = []
+    for i in cs.indices { for j in cs.indices where j > i {
+        let a = boxes[i], b = boxes[j]
+        let dx = a.midX - b.midX, dy = a.midY - b.midY
+        let round = abs(a.width - a.height) < 1e-9 && abs(b.width - b.height) < 1e-9
+        if round ? (dx * dx + dy * dy).squareRoot() < a.width / 2 + b.width / 2 + 2
+                 : a.insetBy(dx: -1, dy: -1).intersects(b) {
+            overlaps.append("\(cs[i].action.label)/\(cs[j].action.label)")
+        }
+    } }
+    require(overlaps.isEmpty, "\(label): short-edge controls do not overlap \(overlaps)")
+    require(!boxes.contains { $0.intersects(ControlPresetLayout.topBarRect(screen)) },
+            "\(label): short-edge grip leaves the top menu band free")
+    let ls = find(cs, "LS"), rs = find(cs, "RS")
+    require(ls.nx < 0.35 && rs.nx > 0.65 && abs(ls.ny - rs.ny) < 1e-9,
+            "\(label): thumb sticks stay near the two short edges")
+}
+require(ControlPresetLayout.shortEdge(for: .referencePhone).map { $0.action } ==
+        ControlPresetLayout.shortEdge(for: ControlPresetScreen(width: 874, height: 402, left: 59, right: 59, bottom: 21)).map { $0.action },
+        "short-edge mapping order is stable across safe-area snapshots")
+
+// The session-wide size multiplier is applied by the actual drawing and hit
+// testing AFTER per-control fitting. Check those physical sizes, not only the
+// normal-size layout, including requests that must be capped on a small canvas.
+func placementIssues(_ cs: [TouchControl], screen s: ControlPresetScreen, sizeScale: Double) -> [String] {
+    let m = ControlPresetLayout.margins(s)
+    let safe = CGRect(x: m.left, y: m.top, width: s.width - m.left - m.right,
+                      height: s.height - m.top - m.bottom)
+    let boxes = cs.map { ControlPresetLayout.box($0, screen: s, sizeScale: sizeScale) }
+    var issues: [String] = []
+    if !boxes.allSatisfy({ safe.contains($0) }) { issues.append("safe area") }
+    if boxes.contains(where: { $0.intersects(ControlPresetLayout.topBarRect(s)) }) { issues.append("menu") }
+    for i in boxes.indices { for j in boxes.indices where j > i {
+        let a = boxes[i], b = boxes[j]
+        let round = abs(a.width - a.height) < 0.001 && abs(b.width - b.height) < 0.001
+        let dx = a.midX - b.midX, dy = a.midY - b.midY
+        if round ? (dx * dx + dy * dy).squareRoot() < a.width / 2 + b.width / 2 + 2 - 1e-7
+                 : a.insetBy(dx: -1, dy: -1).intersects(b) {
+            issues.append("\(cs[i].action.label)/\(cs[j].action.label)")
+        }
+    } }
+    return issues
+}
+for (label, s) in shortScreens {
+    let limit = ControlPresetLayout.sizeLimit(for: ControlPresetLayout.shortEdgeID, screen: s)
+    require(limit >= 1 && limit <= 2, "\(label): short-edge size limit is usable")
+    for requested in [0.5, 0.75, 1, 1.2, 1.5, 2] {
+        let q = min(requested, limit)
+        let cs = ControlPresetStore.layout(of: ControlPresetStore.builtIns[1], screen: s, sizeScale: q)
+        let issues = placementIssues(cs, screen: s, sizeScale: q)
+        require(cs.count == 18 && issues.isEmpty,
+                "\(label): size \(requested) (effective \(q)) fits \(issues)")
+        require(cs.allSatisfy { $0.scale >= 0.5 && $0.scale <= 3 && $0.nx >= 0.03 && $0.nx <= 0.97
+                               && $0.ny >= 0.03 && $0.ny <= 0.97 },
+                "\(label): sized controls survive the editor clamps unchanged")
+        require(ControlPresetStore.reflow(id: ControlPresetLayout.shortEdgeID, controls: cs,
+                                         screen: s, editing: false, sizeScale: q) == nil,
+                "\(label): reflow at size \(q) is idempotent")
+    }
+}
+for (label, screen) in screens {
+    let s = screen.landscape
+    let cs = ControlPresetLayout.xbox(for: s)
+    let limit = ControlPresetLayout.sizeLimit(for: ControlPresetLayout.xboxID, screen: screen)
+    require(limit >= 0.5 && limit <= 2 && placementIssues(cs, screen: s, sizeScale: limit).isEmpty,
+            "\(label): Xbox's overall size also cannot grow into its neighbours")
+}
+
+// --- The built-in controller presets as data: what a user is offered and what each button does.
 let builtIn = ControlPresetStore.builtIns
-require(builtIn.count == 1 && builtIn[0].id == ControlPresetLayout.xboxID && builtIn[0].name == "Xbox controller",
-        "one built-in, listed as \"Xbox controller\"")
-require(builtIn[0].controls.count == 18 && Set(builtIn[0].controls.compactMap { $0.action.padName }) == Set(expected),
-        "the built-in binds the 18 controller inputs, none twice")
-require(builtIn[0].controls.allSatisfy { c in
+require(builtIn.count == 2 && builtIn[0].id == ControlPresetLayout.xboxID
+        && builtIn[1].id == ControlPresetLayout.shortEdgeID
+        && builtIn[0].name == "Xbox controller" && builtIn[1].name == "Short-edge grip",
+        "Xbox controller and Short-edge grip are listed as built-ins")
+require(builtIn.allSatisfy { $0.controls.count == 18 && Set($0.controls.compactMap { $0.action.padName }) == Set(expected) },
+        "each built-in binds the 18 controller inputs, none twice")
+require(builtIn.flatMap(\.controls).allSatisfy { c in
             guard let n = c.action.padName else { return false }
             return TouchPadAction.sample(n, x: 1, y: 1) != GamepadSample()
         }, "every built-in binding produces a non-neutral XInput sample when pressed or deflected")
 require(ControlPresetStore().preset(ControlPresetLayout.xboxID)?.name == "Xbox controller"
+        && ControlPresetStore().preset(ControlPresetLayout.shortEdgeID)?.name == "Short-edge grip"
         && ControlPresetStore(user: []).all.first?.id == ControlPresetLayout.xboxID,
-        "a store with no user layouts still offers the built-in first")
+        "a store with no user layouts offers both built-ins first")
 let one = ControlPresetStore(user: [ControlPreset(id: "u", name: "Mine", controls: [])])
 require(one.resolvedID(ControlPresetLayout.xboxID) == ControlPresetLayout.xboxID && one.resolvedID("u") == "u",
         "a game's remembered built-in or custom layout resolves")
 require(one.resolvedID("gone") == nil && one.resolvedID(nil) == nil, "a deleted or absent layout resolves to none")
+require(ControlPresetStore.restoredID(ControlPresetLayout.xboxID, adaptive: nil) == nil
+        && ControlPresetStore.restoredID(ControlPresetLayout.shortEdgeID, adaptive: false) == nil,
+        "legacy or untrusted built-in IDs preserve their controls as unsaved, not auto-reflowed")
+require(ControlPresetStore.restoredID(ControlPresetLayout.shortEdgeID, adaptive: true) == ControlPresetLayout.shortEdgeID
+        && ControlPresetStore.restoredID("u", adaptive: nil) == "u"
+        && ControlPresetStore.restoredID(nil, adaptive: true) == nil,
+        "tracked built-ins reflow, custom and absent IDs keep their original meaning")
 
 // --- The key sticks carry a glyph that tells them apart; nothing else does.
 require(ControlAction.joystickWASD.stickGlyph == "keyboard", "the WASD stick's glyph is the keyboard")
@@ -186,7 +298,69 @@ let tablet = ControlPresetScreen(width: 1194, height: 834, top: 24, bottom: 20)
 let fitted = ControlPresetStore.layout(of: ControlPresetStore.builtIns[0], screen: tablet)
 require(fitted.map { $0.action } == ControlPresetLayout.xbox(for: tablet).map { $0.action }
         && fitted.map { $0.scale } == ControlPresetLayout.xbox(for: tablet).map { $0.scale },
-        "a built-in is laid out again for the screen it is loaded on")
+        "the Xbox built-in is laid out again for the screen it is loaded on")
+let fittedShort = ControlPresetStore.layout(of: ControlPresetStore.builtIns[1], screen: tablet)
+require(fittedShort.map { $0.action } == ControlPresetLayout.shortEdge(for: tablet).map { $0.action }
+        && fittedShort.map { $0.scale } == ControlPresetLayout.shortEdge(for: tablet).map { $0.scale },
+        "the short-edge built-in is laid out again for the screen it is loaded on")
+let gripID = ControlPresetLayout.shortEdgeID
+let oldGrip = ControlPresetStore.builtIns[1].controls
+let reflowed = ControlPresetStore.reflow(id: gripID, controls: oldGrip, screen: tablet, editing: false)!
+require(reflowed.map { $0.action } == fittedShort.map { $0.action }
+        && reflowed.map { $0.nx } == fittedShort.map { $0.nx },
+        "a saved built-in copy reflows for this canvas even when its layout ID is unchanged")
+require(Set(reflowed.map(\.id)).isDisjoint(with: Set(oldGrip.map(\.id))),
+        "a reflow invalidates every old control ID")
+require(ControlPresetStore.reflow(id: gripID, controls: reflowed, screen: tablet, editing: false) == nil,
+        "the same geometry is a no-op, preventing observation loops and disk rewrites")
+let smallCanvas = ControlPresetScreen(width: 250, height: 180)
+require(ControlPresetLayout.shortEdge(for: smallCanvas).isEmpty
+        && ControlPresetStore.layout(of: ControlPresetStore.builtIns[1], screen: smallCanvas).isEmpty,
+        "an undersized canvas does not silently fall back to a reference-phone layout")
+require(ControlPresetStore.reflow(id: gripID, controls: reflowed, screen: smallCanvas, editing: false) == nil,
+        "an undersized reflow retains IDs; the UI blocks input instead of disconnecting the controller")
+require(!ControlPresetLayout.fits(ControlPresetLayout.xbox(for: smallCanvas), screen: smallCanvas, sizeScale: 0.5)
+        && ControlPresetStore.layout(of: ControlPresetStore.builtIns[0], screen: smallCanvas, sizeScale: 0.5).isEmpty,
+        "the minimum slider size does not claim that a tiny window can fit the Xbox layout")
+require(ControlPresetStore.reflow(id: ControlPresetLayout.xboxID, controls: fitted,
+                                 screen: smallCanvas, editing: false, sizeScale: 0.5) == nil,
+        "a tiny Xbox reflow also preserves the current IDs instead of generating overlapping controls")
+let enlarged = ControlPresetStore.reflow(id: gripID, controls: oldGrip, screen: tablet, editing: false,
+                                        sizeScale: min(1.5, ControlPresetLayout.sizeLimit(for: gripID, screen: tablet)))!
+require(enlarged.map { $0.nx } != reflowed.map { $0.nx },
+        "changing overall size repositions both thumb clusters, not only their drawing size")
+require(ControlPresetStore.reflow(id: nil, controls: oldGrip, screen: tablet, editing: false) == nil
+        && ControlPresetStore.reflow(id: "user", controls: oldGrip, screen: tablet, editing: false) == nil
+        && ControlPresetStore.reflow(id: gripID, controls: oldGrip, screen: tablet, editing: true) == nil,
+        "unsaved, custom and in-progress layouts never reflow")
+var insetOnly = tablet; insetOnly.left = 80; insetOnly.right = 48
+require(ControlPresetStore.reflow(id: gripID, controls: reflowed, screen: insetOnly, editing: false) != nil,
+        "a safe-area-only change reflows the built-in")
+for invalid in [ControlPresetScreen(width: 0, height: 0),
+                ControlPresetScreen(width: .nan, height: 400),
+                ControlPresetScreen(width: 800, height: 400, left: .infinity),
+                ControlPresetScreen(width: 400, height: 100, top: 100)] {
+    require(ControlPresetStore.reflow(id: gripID, controls: oldGrip, screen: invalid, editing: false) == nil,
+            "transient or invalid geometry does not replace a layout")
+}
+let portraitGrip = ControlPresetScreen(width: 402, height: 874, top: 62, bottom: 34)
+require(ControlPresetStore.reflow(id: gripID, controls: oldGrip, screen: portraitGrip, editing: false) != nil,
+        "short-edge grip follows the actual portrait session canvas")
+require(ControlPresetStore.reflow(id: ControlPresetLayout.xboxID, controls: fitted,
+                                 screen: portraitGrip, editing: false) == nil,
+        "portrait does not silently reinterpret the legacy landscape Xbox layout")
+var held = TouchGamepadState()
+held.configure(Set(oldGrip.map(\.id)))
+let oldA = find(oldGrip, "A"), newA = find(reflowed, "A"), finger = UUID()
+held.update(owner: finger, control: oldA.id, value: TouchPadAction.sample("A", x: 0, y: 0))
+require(held.connected && held.sample.buttons != 0, "pre-resize button is held")
+held.configure(Set(reflowed.map(\.id)))
+require(held.connected && held.sample == GamepadSample(),
+        "reflow releases held input without disconnecting the controller")
+held.update(owner: finger, control: oldA.id, value: TouchPadAction.sample("A", x: 0, y: 0))
+require(held.sample == GamepadSample(), "a delayed pre-resize finger cannot revive the old press")
+held.update(owner: UUID(), control: newA.id, value: TouchPadAction.sample("A", x: 0, y: 0))
+require(held.sample.buttons != 0, "a fresh post-resize press still works")
 
 // --- Gesture zones ride with a layout and survive the file.
 var zs = ControlPresetStore()
@@ -219,23 +393,48 @@ setter = panel.split('set: { value in', 1)[1].split('}), in:', 1)[0]
 backdrop = content.split('Color.clear.contentShape(editorCanvas(geo.size))', 1)[1]
 dismiss = function(backdrop, '.onTapGesture {').split('{', 1)[1][:-1]
 sizes = '\n'.join(function(content, signature) for signature in ('static func diameter(', 'static func size('))
+lifecycle = '\n'.join(function(content, signature) for signature in (
+    'func preserveEditedBuiltIn(', 'func setControlsForGeometry(', 'func hitsInteractive('))
+saved = function(content, 'private struct Saved: Codable').replace('private struct', 'struct', 1)
 canvas = function(content, 'private func editorCanvas(')
+controls_property = function(content, '@Published var controls: [TouchControl] = []').replace('@Published ', '', 1)
+reflow_callback = function(presets, 'func reflowBuiltIn(screen: ControlPresetScreen)')
 editor_tests = r'''
 final class EditorControls {
     static let shared = EditorControls()
     static let baseDiameter: CGFloat = 64
     var sizeScale = 1.0
-    var controls: [TouchControl] = []
     var selected: UUID? = UUID()
     var editing = true
+    var loading = false
+    var visible = true
+    var fitsCanvas = true
+    var hapticsEnabled = true
+    var layoutID: String?
+    var editBaseline: [TouchControl] = []
+    var editZoneBaseline: [GestureZone] = []
+    var saves = 0
+    var savedLayouts: [String?] = []
+    func save() {
+        if !loading { saves += 1; savedLayouts.append(layoutID) }
+    }
     func index(of id: UUID?) -> Int? { controls.firstIndex { $0.id == id } }
-''' + sizes + r'''
+''' + '\n'.join((controls_property, sizes, lifecycle, saved)) + r'''
 }
 final class EditorZones {
+    static let shared = EditorZones()
     static var enabled = true
     var selected: UUID? = UUID()
     var zones: [GestureZone] = []
+    func contains(_ p: CGPoint, in bounds: CGRect) -> Bool {
+        Self.enabled && zones.contains { $0.contains(p, in: bounds.size) }
+    }
 }
+enum TouchControlsOverlay {
+    static func showsLayoutMenu(_ m: EditorControls) -> Bool { !m.editing && m.visible }
+}
+typealias TouchControlsModel = EditorControls
+typealias GestureZonesModel = EditorZones
 func setSize(_ control: TouchControl, _ value: Double, _ m: EditorControls) {
 ''' + setter + r'''
 }
@@ -245,6 +444,32 @@ func dismissPanel(_ m: EditorControls, _ zones: EditorZones) {
 let editor = EditorControls()
 var first = TouchControl(), second = TouchControl()
 editor.controls = [first, second]
+editor.layoutID = ControlPresetLayout.xboxID
+editor.editBaseline = editor.controls
+editor.savedLayouts.removeAll()
+// The editor writes positions on every touch, including a zero-distance tap.
+editor.controls[0].nx = editor.controls[0].nx
+require(editor.layoutID == ControlPresetLayout.xboxID,
+        "a tap that writes equal positions keeps a built-in source")
+editor.savedLayouts.removeAll()
+editor.controls[0].nx = 0.44
+require(editor.layoutID == nil && !editor.savedLayouts.isEmpty && editor.savedLayouts.allSatisfy { $0 == nil },
+        "the first control edit clears a built-in source before saving")
+editor.layoutID = ControlPresetLayout.xboxID
+editor.editBaseline = editor.controls
+EditorZones.shared.zones = []
+editor.editZoneBaseline = []
+editor.preserveEditedBuiltIn()
+require(editor.layoutID == ControlPresetLayout.xboxID, "zone bookkeeping without an edit keeps a built-in source")
+EditorZones.shared.zones.append(GestureZone())
+editor.preserveEditedBuiltIn()
+require(editor.layoutID == nil, "an actual gesture-zone edit clears a built-in source")
+EditorZones.shared.zones = []
+editor.layoutID = ControlPresetLayout.xboxID
+let savedCount = editor.savedLayouts.count
+editor.setControlsForGeometry([first, second])
+require(editor.layoutID == ControlPresetLayout.xboxID && editor.savedLayouts.count == savedCount,
+        "geometry-derived controls do not clear provenance or write a save")
 setSize(first, 3.0, editor)
 require(editor.controls[0].scale == 3 && editor.controls[1].scale == 1, "size slider changes only its selected control")
 editor.controls[0].locked = true
@@ -262,8 +487,6 @@ require(editor.selected == nil && editorZones.selected == nil && editor.editing,
         "an outside tap dismisses either panel and keeps edit mode")
 require(editor.controls == beforeDismiss, "dismissing the panel preserves control edits")
 #if canImport(SwiftUI)
-typealias TouchControlsModel = EditorControls
-typealias GestureZonesModel = EditorZones
 let m = editor, zones = editorZones
 ''' + canvas + r'''
 let canvasScreen = CGSize(width: 800, height: 400)
@@ -285,19 +508,125 @@ editor.controls[0].action = .pad("RT"); editor.controls[0].scale = 1
 require(!editorCanvas(canvasScreen).contains(CGPoint(x: 445, y: 200)), "wide shoulder controls keep their full touch region")
 #endif
 '''
-tests = tests.replace('__EDITOR_SIZE_TESTS__', editor_tests)
+adaptive_tests = r'''
+// Compile the actual model reflow callback, including size caps and tiny-window
+// suspension, against the same minimal controls state used above.
+final class AdaptivePresets {
+    static var enabled = true
+''' + reflow_callback + r'''
+}
+let adaptive = AdaptivePresets(), live = EditorControls.shared
+live.editing = false
+live.controls = oldGrip
+live.layoutID = gripID
+live.sizeScale = 2
+live.saves = 0
+adaptive.reflowBuiltIn(screen: tablet)
+require(live.fitsCanvas && live.sizeScale <= ControlPresetLayout.sizeLimit(for: gripID, screen: tablet)
+        && placementIssues(live.controls, screen: tablet, sizeScale: live.sizeScale).isEmpty,
+        "model reflow caps enlarged controls before placing them on the new canvas")
+require(live.saves == 0 && live.layoutID == gripID,
+        "the model reflows without disk writes or losing the built-in source")
+let fittedIDs = live.controls.map(\.id)
+adaptive.reflowBuiltIn(screen: smallCanvas)
+require(!live.fitsCanvas && live.controls.map(\.id) == fittedIDs,
+        "tiny-window suspension keeps every controller ID instead of unplugging the pad")
+adaptive.reflowBuiltIn(screen: tablet)
+require(live.fitsCanvas && live.controls.map(\.id) == fittedIDs,
+        "returning to the previous canvas resumes the same fitted controls")
+live.editing = true
+adaptive.reflowBuiltIn(screen: smallCanvas)
+require(live.fitsCanvas && live.controls.map(\.id) == fittedIDs,
+        "the editor keeps the existing layout accessible even on a tiny canvas")
+live.layoutID = "custom"
+live.preserveEditedBuiltIn()
+require(live.layoutID == "custom", "editing never drops a custom layout's write-back target")
+live.layoutID = gripID
+live.loading = true
+live.setControlsForGeometry(oldGrip)
+require(live.loading && live.layoutID == gripID,
+        "geometry updates preserve an outer loading transaction")
+live.loading = false
 
-with tempfile.TemporaryDirectory(prefix='madeira-presets-') as tmp:
-    src, exe = Path(tmp) / 'main.swift', Path(tmp) / 'check'
-    # CoreGraphics where it exists: on macOS, Foundation alone no longer gives CGRect
-    # its members (midX, width, ...); Linux's Foundation still does.
-    header = 'import Foundation\n#if canImport(CoreGraphics)\nimport CoreGraphics\n#endif\n#if canImport(SwiftUI)\nimport SwiftUI\n#endif\n'
-    src.write_text(header + actions + pure_touch + pure + tests)
-    subprocess.run([os.environ.get('SWIFTC', 'swiftc'), str(src), '-o', str(exe)], check=True)
-    subprocess.run([str(exe)], check=True)
+let legacyWorkingCopy = try! JSONDecoder().decode(EditorControls.Saved.self,
+    from: Data(#"{"controls":[],"visible":true,"layout":"builtin.xbox"}"#.utf8))
+require(legacyWorkingCopy.adaptiveLayout == nil && legacyWorkingCopy.haptics == nil
+        && ControlPresetStore.restoredID(legacyWorkingCopy.layout, adaptive: legacyWorkingCopy.adaptiveLayout) == nil,
+        "the actual working-copy schema decodes old files without trusting a built-in ID")
+let trackedWorkingCopy = EditorControls.Saved(controls: oldGrip, visible: true, layout: gripID,
+                                            haptics: true, adaptiveLayout: true)
+let trackedRoundTrip = try! JSONDecoder().decode(EditorControls.Saved.self,
+    from: JSONEncoder().encode(trackedWorkingCopy))
+require(trackedRoundTrip.controls == oldGrip
+        && ControlPresetStore.restoredID(trackedRoundTrip.layout, adaptive: trackedRoundTrip.adaptiveLayout) == gripID,
+        "tracked working copies retain both their controls and adaptive provenance")
+
+// The actual window hit test, not just the editor's exclusion Path: the full
+// shoulder width is interactive, whereas the corners of a round button are not.
+live.editing = false; live.layoutID = nil; live.visible = true; live.fitsCanvas = true; live.sizeScale = 1
+EditorZones.shared.zones = []
+let hitBounds = CGRect(x: 0, y: 0, width: 800, height: 400)
+var shoulder = TouchControl(); shoulder.action = .pad("RT")
+live.controls = [shoulder]
+require(live.hitsInteractive(CGPoint(x: 448, y: 200), in: hitBounds, topBar: false),
+        "the drawn outer shoulder edge does not pass a press through to the game")
+require(!live.hitsInteractive(CGPoint(x: 400, y: 226), in: hitBounds, topBar: false),
+        "space below the actual shoulder rectangle stays click-through")
+live.sizeScale = 1.5
+require(live.hitsInteractive(CGPoint(x: 470, y: 200), in: hitBounds, topBar: false),
+        "the shoulder touch region follows the session-wide size multiplier")
+live.sizeScale = 1; live.controls[0].action = .pad("A")
+require(!live.hitsInteractive(CGPoint(x: 428, y: 228), in: hitBounds, topBar: false),
+        "a round button does not steal touches from its bounding-box corners")
+var hitZone = GestureZone(); hitZone.x = 0.7; hitZone.y = 0.5; hitZone.w = 0.2; hitZone.h = 0.2
+EditorZones.shared.zones = [hitZone]
+require(live.hitsInteractive(CGPoint(x: 640, y: 240), in: hitBounds, topBar: false),
+        "gesture zones still participate in the window hit test")
+live.fitsCanvas = false
+require(!live.hitsInteractive(CGPoint(x: 400, y: 200), in: hitBounds, topBar: false)
+        && !live.hitsInteractive(CGPoint(x: 640, y: 240), in: hitBounds, topBar: false),
+        "suspended layouts pass both control and zone touches through")
+require(live.hitsInteractive(CGPoint(x: 400, y: 30), in: hitBounds),
+        "the top menu remains accessible while gameplay controls are suspended")
+'''
+tests = tests.replace('__EDITOR_SIZE_TESTS__', editor_tests + adaptive_tests)
+
+if args.wiring_only:
+    print('SKIP: Swift compilation/runtime layout tests (--wiring-only); only source wiring is checked')
+else:
+    with tempfile.TemporaryDirectory(prefix='madeira-presets-') as tmp:
+        src, exe = Path(tmp) / 'main.swift', Path(tmp) / 'check'
+        # CoreGraphics where it exists: on macOS, Foundation alone no longer gives CGRect
+        # its members (midX, width, ...); Linux's Foundation still does.
+        header = 'import Foundation\n#if canImport(CoreGraphics)\nimport CoreGraphics\n#endif\n#if canImport(SwiftUI)\nimport SwiftUI\n#endif\n'
+        src.write_text(header + actions + pure_touch + pure + tests, encoding='utf-8')
+        subprocess.run([os.environ.get('SWIFTC', 'swiftc'), str(src), '-o', str(exe)], check=True)
+        subprocess.run([str(exe)], check=True)
 
 # ---------------------------------------------------------------- Part B
-gamepad = (app / 'GamepadInput.swift').read_text()
+gamepad = (app / 'GamepadInput.swift').read_text(encoding='utf-8')
+model = content[content.index('final class TouchControlsModel'):content.index('/// Click-through EXCEPT')]
+zones_ui = (app / 'GestureZones.swift').read_text(encoding='utf-8')
+touch_view = function(touch, 'final class TouchPadView: UIView {')
+zone_view = function(zones_ui, 'final class GestureZoneView: UIView {')
+assert 'name: TouchControlsHost.geometryChanged' in function(touch_view, 'init() {'), \
+    'UIKit pad surfaces subscribe to geometry changes'
+assert 'releaseAll(); changed?(.zero, false)' in touch_view, \
+    'UIKit pad surfaces publish a neutral state when geometry changes'
+assert 'name: TouchControlsHost.geometryChanged' in zone_view and 'carryX = 0; carryY = 0' in zone_view, \
+    'gesture zones cancel fingers and fractional mouse motion on a geometry change'
+assert 'onReceive(NotificationCenter.default.publisher(for: TouchControlsHost.geometryChanged))' in content, \
+    'SwiftUI controls cancel drag input on a geometry change'
+assert 'c.scale = scale * fit.scale' in function(presets, 'static func shortEdge(for'), \
+    'short-edge fitting does not multiply the global size twice'
+assert 'guard let fitting = ControlPresetLayout.controls(for: id, screen: screen' in presets \
+    and 'm.fitsCanvas = false' in function(presets, 'func reflowBuiltIn(screen: ControlPresetScreen)'), \
+    'built-in fitting suspends input rather than unplugging the pad on tiny windows'
+assert 'let sizeScale = min(m.sizeScale, ControlPresetLayout.sizeLimit(for: id, screen: screen))' in presets, \
+    'built-in reflow caps the session-wide size before drawing'
+assert 'else if CGRect(x: cx - size.width / 2' in model and 'size = Self.size(c)' in model, \
+    'window hit tests use the complete drawn rectangle for wide controls'
+
 for flag, where in (('MADEIRA_CONTROL_PRESETS', presets), ('MADEIRA_CONTROLS_EDITOR_DONE', content)):
     assert f'.flag("{flag}")' in where, flag + ' is a kill switch'
 # Defaults an existing user would notice are opt-in: the built-in is never applied
@@ -316,6 +645,11 @@ ended = function(presets, 'func editingEnded(baseline: [TouchControl], zoneBasel
 assert ended.index('guard Self.enabled else { return }') < ended.index('s.overwrite(id: id'), 'write-back is switchable'
 default = function(presets, 'func applyDefaultIfNeeded(screen: ControlPresetScreen) {')
 assert 'm.controls.isEmpty' in default and 'm.needsDefaultLayout = false' in default, 'applied once, never over controls'
+assert default.index('if load(ControlPresetLayout.xboxID') < default.index('m.needsDefaultLayout = false', default.index('if load(')), \
+    'a failed default load keeps the one-time default pending'
+deleting = function(presets, 'func delete(_ id: String) -> Bool {')
+assert 'let restored = Self.touchPad' in deleting and 'if !restored { m.layoutID = nil }' in deleting, \
+    'a deleted active layout never stays as the on-screen copy source'
 assert 'Self.touchPad' in function(presets, 'var defaultPending: Bool {'), 'no controller default without touch XInput'
 overlay = function(content, 'struct TouchControlsOverlay: View {')
 assert overlay.index('Color.clear.contentShape(editorCanvas(geo.size))') < overlay.index('GestureZonesLayer('), 'dismissal stays behind editable controls'
@@ -333,7 +667,7 @@ assert run.index('GamepadInput.shared.reserveSessionSlot(') < run.index('Dispatc
 
 # The built-in reaches a library session: LibraryHUD replaces the overlay's top bar there, so the
 # Session menu carries the same menu, and a game remembers the layout it was loaded from.
-lib = (app / 'Library.swift').read_text()
+lib = (app / 'Library.swift').read_text(encoding='utf-8')
 hud = function(lib, 'struct LibraryHUD: View {')
 menu = function(hud, 'private var menu: some View {')
 row = menu.index('ControlLayoutMenu(style: .row)')
@@ -350,11 +684,16 @@ entry = function(lib, 'struct LibraryEntry: Codable, Identifiable {')
 assert 'var controlLayout: String?' in entry, 'optional, so older library files decode'
 model_lib = function(lib, 'final class LibraryModel: ObservableObject {')
 begin = function(model_lib, 'func begin(_ entry: LibraryEntry')
-assert 'store.resolvedID(entry.controlLayout)' in begin and 'savedLayout = controls.layoutID' in begin
+assert 'store.resolvedID(' in begin and 'savedLayout = controls.layoutID' in begin
+assert 'ControlPresetStore.restoredID(entry.controlLayout, adaptive: entry.adaptiveControlLayout)' in begin, \
+    'legacy per-game built-ins must pass the provenance check before auto-reflow'
+assert 'var adaptiveControlLayout: Bool?' in entry, 'older library profiles decode without an adaptive marker'
 assert begin.index('if let profile = entry.controls') < begin.index('resolvedID'), "the layout follows the game's own controls only"
-assert 'entry.controlLayout = controls.layoutID' in function(model_lib, 'func saveCurrentProfile()')
+profile_save = function(model_lib, 'func saveCurrentProfile()')
+assert 'entry.controlLayout = controls.layoutID' in profile_save and 'entry.adaptiveControlLayout = true' in profile_save
 fin = function(model_lib, 'private func finish()')
-assert fin.index('saveCurrentProfile()') < fin.index('controls.layoutID = savedLayout'), 'the session restores the shared layout after saving'
+assert fin.index('controls.editing = false') < fin.index('saveCurrentProfile()') \
+    < fin.index('controls.layoutID = savedLayout'), 'finish ends editing, saves the game, then restores the shared layout'
 
 # The WASD stick's centre glyph: drawn by the stick face, fed by the action.
 face = function(content, 'struct JoystickFace: View {')

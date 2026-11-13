@@ -53,7 +53,7 @@ struct SteamSignInView: View {
             .navigationTitle("Steam").navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button(steam.signedIn ? "Done" : "Cancel") { steam.cancelSignIn(); dismiss() }
+                    Button(steam.signedIn ? L("Done") : L("Cancel")) { steam.cancelSignIn(); dismiss() }
                 }
             }
             .onAppear {
@@ -110,8 +110,9 @@ struct SteamSignInView: View {
         Section {
             if let type = prompt.codeType {
                 Text(type == .device
-                     ? "Enter the Steam Guard code shown in the Steam app on your phone."
-                     : "Enter the code Steam sent to your email" + (prompt.hint.isEmpty ? "." : " (\(prompt.hint))."))
+                     ? L("Enter the Steam Guard code shown in the Steam app on your phone.")
+                     : prompt.hint.isEmpty ? L("Enter the code Steam sent to your email.")
+                     : String(format: L("Enter the code Steam sent to your email (%@)."), prompt.hint))
                 TextField("Code", text: $code)
                     .textContentType(.oneTimeCode).textInputAutocapitalization(.characters).autocorrectionDisabled()
                     .font(.title3.monospaced()).focused($focus, equals: .code)
@@ -126,8 +127,8 @@ struct SteamSignInView: View {
                 HStack(spacing: 12) {
                     ProgressView()
                     Text(prompt.codeType == nil
-                         ? "Approve this sign-in in the Steam app on your phone."
-                         : "Or approve this sign-in in the Steam app.")
+                         ? L("Approve this sign-in in the Steam app on your phone.")
+                         : L("Or approve this sign-in in the Steam app."))
                         .foregroundStyle(.secondary)
                 }
             }

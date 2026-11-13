@@ -280,20 +280,20 @@ struct OnboardingView: View {
         }
     }
 
-    private func header(_ title: String, symbol: String) -> some View {
+    private func header(_ title: LocalizedStringKey, symbol: String) -> some View {
         VStack(alignment: .leading, spacing: 14) {
             Image(systemName: symbol).font(.system(size: 44)).foregroundStyle(.tint).accessibilityHidden(true)
             Text(title).font(.title.bold()).accessibilityAddTraits(.isHeader)
         }
     }
 
-    private func primary(_ title: String, symbol: String, action: @escaping () -> Void) -> some View {
+    private func primary(_ title: LocalizedStringKey, symbol: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Label(title, systemImage: symbol).fontWeight(.semibold).frame(maxWidth: .infinity, minHeight: 36)
         }.buttonStyle(.borderedProminent).controlSize(.large)
     }
 
-    private func secondary(_ title: String, action: @escaping () -> Void) -> some View {
+    private func secondary(_ title: LocalizedStringKey, action: @escaping () -> Void) -> some View {
         Button(title, action: action).frame(maxWidth: .infinity, minHeight: 44)
     }
 
@@ -326,18 +326,18 @@ struct OnboardingView: View {
                 Text("Since you last ran setup, Madeira has something new to set up:").font(.title3)
             } else {
                 Text("Welcome to Madeira").font(.largeTitle.bold()).accessibilityAddTraits(.isHeader)
-                Text("Madeira runs Windows games on your \(UIDevice.current.userInterfaceIdiom == .pad ? "iPad" : "iPhone").")
+                Text("Madeira runs Windows games on your \(device).")
                     .font(.title3)
                 Text("A few optional steps get you ready:").foregroundStyle(.secondary)
             }
             let pages = model.steps
             let offered: [LocalizedStringKey] =
-                (pages.contains(.localDevVPN) ? ["Install LocalDevVPN, which Madeira enables JIT through."] : [])
-                + (pages.contains(.jit) ? ["Choose how Madeira enables JIT."] : [])
-                + (pages.contains(.signIn) ? ["Sign in to Steam in Madeira."] : [])
-                + (pages.contains(.dockClient) ? ["Download Valve's Steam client components for Madeira Dock."] : [])
-                + (pages.contains(.wineMono) ? ["Download Wine Mono, for games built on .NET Framework."] : [])
-                + (pages.contains(.vcRedist) ? ["Install Microsoft's Visual C++ runtime, which many games need."] : [])
+                (pages.contains(.localDevVPN) ? [LocalizedStringKey("Install LocalDevVPN, which Madeira enables JIT through.")] : [])
+                + (pages.contains(.jit) ? [LocalizedStringKey("Choose how Madeira enables JIT.")] : [])
+                + (pages.contains(.signIn) ? [LocalizedStringKey("Sign in to Steam in Madeira.")] : [])
+                + (pages.contains(.dockClient) ? [LocalizedStringKey("Download Valve's Steam client components for Madeira Dock.")] : [])
+                + (pages.contains(.wineMono) ? [LocalizedStringKey("Download Wine Mono, for games built on .NET Framework.")] : [])
+                + (pages.contains(.vcRedist) ? [LocalizedStringKey("Install Microsoft's Visual C++ runtime, which many games need.")] : [])
             ForEach(offered.indices, id: \.self) { index in point(index + 1, offered[index]) }
             primary("Get started", symbol: "arrow.right") { model.next() }.padding(.top, 8)
             secondary("Skip setup") { model.skip() }
@@ -387,15 +387,15 @@ struct OnboardingView: View {
             Text("JIT lets Madeira run Windows code. Choose how your \(device) gets it.")
             VStack(spacing: 12) {
                 jitChoice("In-app", symbol: "iphone.radiowaves.left.and.right",
-                          detail: !OnDevicePairing.isSupported ? "Needs iOS 27 or later."
-                              : pairedOnDevice ? "Paired on this \(device)."
-                              : "Pair this \(device) with Madeira in Settings. No computer needed.",
+                          detail: !OnDevicePairing.isSupported ? L("Needs iOS 27 or later.")
+                              : pairedOnDevice ? String(format: L("Paired on this %@."), device)
+                              : String(format: L("Pair this %@ with Madeira in Settings. No computer needed."), device),
                           done: pairedOnDevice, enabled: OnDevicePairing.isSupported) { choose(.onDevice) }
                 jitChoice("In-app with pairing file", symbol: "doc.badge.plus",
-                          detail: fileImported ? "Pairing file imported." : "Use a pairing file made on a computer.",
+                          detail: fileImported ? L("Pairing file imported.") : L("Use a pairing file made on a computer."),
                           done: fileImported) { choose(.pairingFile) }
                 jitChoice("StikDebug", symbol: "ant",
-                          detail: "Enable JIT with the StikDebug app.",
+                          detail: L("Enable JIT with the StikDebug app."),
                           done: jit.method == .stikDebug) { choose(.stikDebug) }
             }
             secondary("I'll do this later") { model.next() }
@@ -487,7 +487,7 @@ struct OnboardingView: View {
         .font(.subheadline).foregroundStyle(.secondary)
     }
 
-    private func jitChoice(_ title: String, symbol: String, detail: String, done: Bool, enabled: Bool = true,
+    private func jitChoice(_ title: LocalizedStringKey, symbol: String, detail: String, done: Bool, enabled: Bool = true,
                            action: @escaping () -> Void) -> some View {
         Button(action: action) {
             HStack(spacing: 14) {
@@ -594,8 +594,8 @@ struct OnboardingView: View {
         VStack(alignment: .leading, spacing: 18) {
             header("Sign in to Steam", symbol: "person.crop.circle.badge.checkmark")
             Text(model.steps.contains(.dockClient)
-                 ? "When you start a game with Madeira Dock, Madeira hands this sign-in to Valve's own Steam client, which signs in and checks your license."
-                 : "Madeira keeps a Steam sign-in so it can start your Steam games with your own account.")
+                 ? L("When you start a game with Madeira Dock, Madeira hands this sign-in to Valve's own Steam client, which signs in and checks your license.")
+                 : L("Madeira keeps a Steam sign-in so it can start your Steam games with your own account."))
             VStack(alignment: .leading, spacing: 10) {
                 Label("Your password goes only to Steam and is never saved.", systemImage: "lock.fill")
                 Label("The sign-in is kept in this device's Keychain until you sign out.", systemImage: "iphone")
@@ -631,7 +631,7 @@ struct OnboardingView: View {
                     if let error = dock.error {
                         Label(error, systemImage: "exclamationmark.circle.fill").foregroundStyle(.red)
                     }
-                    primary(dock.error == nil ? "Download components" : "Try again", symbol: "arrow.down.circle.fill") {
+                    primary(dock.error == nil ? LocalizedStringKey("Download components") : LocalizedStringKey("Try again"), symbol: "arrow.down.circle.fill") {
                         LogStore.shared.log("[onboarding] components download")
                         dock.prepareClient()
                     }
@@ -665,7 +665,7 @@ struct OnboardingView: View {
                     if let error = mono.error {
                         Label(error, systemImage: "exclamationmark.circle.fill").foregroundStyle(.red)
                     }
-                    primary(mono.error == nil ? "Download Wine Mono" : "Try again", symbol: "arrow.down.circle.fill") {
+                    primary(mono.error == nil ? LocalizedStringKey("Download Wine Mono") : LocalizedStringKey("Try again"), symbol: "arrow.down.circle.fill") {
                         LogStore.shared.log("[onboarding] Wine Mono download")
                         mono.install()
                     }
@@ -700,7 +700,7 @@ struct OnboardingView: View {
                     if let error = redist.error {
                         Label(error, systemImage: "exclamationmark.circle.fill").foregroundStyle(.red)
                     }
-                    primary(redist.error == nil ? "Download and install" : "Try again", symbol: "arrow.down.circle.fill") {
+                    primary(redist.error == nil ? LocalizedStringKey("Download and install") : LocalizedStringKey("Try again"), symbol: "arrow.down.circle.fill") {
                         LogStore.shared.log("[onboarding] Visual C++ runtime install")
                         redist.install()
                     }

@@ -1402,6 +1402,10 @@ struct ContentView: View {
             .onReceive(ShortcutRouter.shared.$pendingExe) { _ in launchPendingShortcut() }
             .onChange(of: library.enabled) { _, _ in launchPendingShortcut() }
         }
+        // A fold/unfold or window resize need not post an orientation event.
+        .onGeometryChange(for: CGSize.self) { $0.size } action: { _ in
+            TouchControlsHost.updateFrame()
+        }
     }
 
     /// The developer interface. Orientation comes from the view's own shape, not
@@ -3773,12 +3777,13 @@ struct ContentView: View {
                 MadeiraConfig.set("desktop-size", p.value)
                 desktopSizeTick += 1
             } label: {
-                if p.w == cw && p.h == ch { Label(p.label, systemImage: "checkmark") } else { Text(p.label) }
+                let title = ResolutionChoices.localizedLabel(p.label)
+                if p.w == cw && p.h == ch { Label(title, systemImage: "checkmark") } else { Text(title) }
             }
         }
         return Menu {
             ForEach(groups, id: \.title) { group in
-                Section(group.title) { ForEach(group.choices, id: \.value) { pick($0) } }
+                Section(ResolutionChoices.localizedLabel(group.title)) { ForEach(group.choices, id: \.value) { pick($0) } }
             }
             if let custom { pick(custom) }
         } label: {
@@ -4112,7 +4117,9 @@ final class TouchControlsModel: ObservableObject {
     static let shared = TouchControlsModel()
     static let baseDiameter: CGFloat = 64
 
-    @Published var controls: [TouchControl] = [] { didSet { save() } }
+    @Published var controls: [TouchControl] = [] {
+        didSet { preserveEditedBuiltIn(); save() }
+    }
     @Published var visible = true               { didSet { save() } }
     @Published var snapToGrid = false
     @Published var hapticsEnabled = true        { didSet { save() } }
@@ -4139,6 +4146,13 @@ final class TouchControlsModel: ObservableObject {
     /// pinch `scale`. A library entry keeps its own (Control size) and sets it
     /// for its session; transient, so the developer interface stays at 1.
     @Published var sizeScale: Double = 1.0
+    /// A valid but temporarily tiny window may not fit an adaptive layout.
+    /// Keep its IDs (and connected pad) but hide/disable gameplay input there.
+    @Published var fitsCanvas = true
+    var sizeLimit: Double {
+        guard ControlPresetsModel.enabled, !editing else { return 2 }
+        return ControlPresetLayout.sizeLimit(for: layoutID, screen: ControlPresetsModel.currentScreen())
+    }
 
     /// A control's drawn diameter. The view, the hit test and the mapping
     /// panel's placement all use it, so the touch region and the pixels agree.
@@ -4156,7 +4170,10 @@ final class TouchControlsModel: ObservableObject {
     }
 
     /// `layout` is optional so files written before it existed still decode.
-    private struct Saved: Codable { var controls: [TouchControl]; var visible: Bool; var layout: String?; var haptics: Bool? }
+    private struct Saved: Codable {
+        var controls: [TouchControl]; var visible: Bool; var layout: String?; var haptics: Bool?
+        var adaptiveLayout: Bool?
+    }
 
     private init() {
         loading = true
@@ -4164,16 +4181,38 @@ final class TouchControlsModel: ObservableObject {
            let s = try? JSONDecoder().decode(Saved.self, from: d) {
             controls = s.controls
             visible  = s.visible
-            layoutID = s.layout
+            layoutID = ControlPresetStore.restoredID(s.layout, adaptive: s.adaptiveLayout)
             hapticsEnabled = s.haptics ?? true
         }
         needsDefaultLayout = !FileManager.default.fileExists(atPath: Self.url.path)
         loading = false
     }
 
+    /// Clear provenance BEFORE persisting the first edit, not only on Done:
+    /// a crash or game exit while the editor is open must not restore it as a
+    /// pristine built-in and replace the edited copy on the next resize.
+    /// Compare with the edit baseline: the editor writes a control's position
+    /// on every touch, including a zero-distance tap that changes nothing, and
+    /// that must not drop the built-in source or stop fold/resize reflow.
+    func preserveEditedBuiltIn() {
+        guard !loading, editing, let id = layoutID, ControlPresetStore.isBuiltIn(id) else { return }
+        guard controls != editBaseline || GestureZonesModel.shared.zones != editZoneBaseline else { return }
+        layoutID = nil
+    }
+
+    /// A built-in's live geometry is derived, not a user edit. Avoid rewriting
+    /// madeira-controls.json on every intermediate resize/safe-area update.
+    func setControlsForGeometry(_ next: [TouchControl]) {
+        let wasLoading = loading
+        loading = true
+        controls = next
+        loading = wasLoading
+    }
+
     private func save() {
         guard !loading else { return }
-        guard let d = try? JSONEncoder().encode(Saved(controls: controls, visible: visible, layout: layoutID, haptics: hapticsEnabled))
+        guard let d = try? JSONEncoder().encode(Saved(controls: controls, visible: visible, layout: layoutID,
+                                                     haptics: hapticsEnabled, adaptiveLayout: true))
         else { return }
         try? d.write(to: Self.url, options: .atomic)
     }
@@ -4210,12 +4249,17 @@ final class TouchControlsModel: ObservableObject {
         let barW: CGFloat = buttons * 44 + (buttons - 1) * 10
         if topBar, CGRect(x: bounds.midX - barW / 2 - 10, y: 0,
                           width: barW + 20, height: 68).contains(p) { return true }
-        guard visible else { return false }
+        guard visible, fitsCanvas else { return false }
         for c in controls {
-            let r = Self.diameter(c) / 2
+            let size = Self.size(c)
             let cx = CGFloat(c.nx) * bounds.width
             let cy = CGFloat(c.ny) * bounds.height
-            if hypot(p.x - cx, p.y - cy) <= r { return true }
+            if abs(size.width - size.height) < 0.001 {
+                if hypot(p.x - cx, p.y - cy) <= size.width / 2 { return true }
+            } else if CGRect(x: cx - size.width / 2, y: cy - size.height / 2,
+                             width: size.width, height: size.height).contains(p) {
+                return true
+            }
         }
         return GestureZonesModel.shared.contains(p, in: bounds)
     }
@@ -4228,6 +4272,31 @@ final class TouchControlsModel: ObservableObject {
 /// lands on the hosting root view means empty space, and empty space belongs to
 /// the game underneath — mouse-look must keep working between the buttons.
 final class ControlsWindow: UIWindow {
+    private var lastGeometry: ControlPresetScreen?
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        geometryDidChange()
+    }
+
+    override func safeAreaInsetsDidChange() {
+        super.safeAreaInsetsDidChange()
+        geometryDidChange()
+    }
+
+    private func geometryDidChange() {
+        let i = safeAreaInsets
+        let geometry = ControlPresetScreen(width: Double(bounds.width), height: Double(bounds.height),
+                                           left: Double(i.left), right: Double(i.right),
+                                           top: Double(i.top), bottom: Double(i.bottom))
+        guard geometry.isUsable, geometry != lastGeometry else { return }
+        lastGeometry = geometry
+        // Deliver after UIKit's layout pass, not while SwiftUI updates its views.
+        DispatchQueue.main.async {
+            NotificationCenter.default.post(name: TouchControlsHost.geometryChanged, object: nil)
+        }
+    }
+
     override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
         let m = TouchControlsModel.shared
         // Edit mode owns the whole screen: drags and the scale pinch must not
@@ -4263,7 +4332,26 @@ final class ControlsWindow: UIWindow {
 }
 
 enum TouchControlsHost {
+    static let geometryChanged = Notification.Name("MadeiraControlsGeometryChanged")
     private static var window: ControlsWindow?
+
+    /// Physical safe-area insets remain available even when the SwiftUI canvas
+    /// ignores safe areas to draw edge-to-edge.
+    static var screen: ControlPresetScreen? {
+        guard let window else { return nil }
+        let i = window.safeAreaInsets
+        let screen = ControlPresetScreen(width: Double(window.bounds.width), height: Double(window.bounds.height),
+                                         left: Double(i.left), right: Double(i.right),
+                                         top: Double(i.top), bottom: Double(i.bottom))
+        return screen.isUsable ? screen : nil
+    }
+
+    static func updateFrame() {
+        guard let window, let scene = window.windowScene else { return }
+        let frame = scene.coordinateSpace.bounds
+        guard window.frame != frame else { return }
+        window.frame = frame
+    }
 
     static func attach() {
         let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
@@ -4306,6 +4394,7 @@ struct TouchControlsOverlay: View {
             // bar; the controls hide while its menu or starting screen is up.
             let session = library.current != nil || library.preparing != nil
             let landscape = geo.size.width > geo.size.height || session
+            let screen = presetScreen(geo)
             ZStack(alignment: .top) {
                 // The library between sessions (the window came up for a start that did not
                 // happen) draws nothing over the library's own screens.
@@ -4314,7 +4403,7 @@ struct TouchControlsOverlay: View {
                         Color.clear.contentShape(editorCanvas(geo.size))
                             .onTapGesture { m.selected = nil; zones.selected = nil }
                     }
-                    if (m.visible || m.editing) && !library.blocksGameplayTouch {
+                    if ((m.visible && m.fitsCanvas) || m.editing) && !library.blocksGameplayTouch {
                         if GestureZonesModel.enabled {
                             GestureZonesLayer(screen: geo.size, editing: m.editing)
                         }
@@ -4331,14 +4420,23 @@ struct TouchControlsOverlay: View {
             .frame(width: geo.size.width, height: geo.size.height, alignment: .top)
             .contentShape(Rectangle())
             .gesture(scalePinch, including: m.editing ? .all : .subviews)
-            .onAppear { applyDefaultLayout(geo); configureGamepad(landscape: landscape) }
-            .onChange(of: geo.size) { _, _ in applyDefaultLayout(geo); configureGamepad(landscape: landscape) }
-            .onChange(of: m.controls) { _, _ in configureGamepad(landscape: landscape) }
+            .onAppear { updateLayout(screen, landscape: landscape) }
+            .onChange(of: screen) { _, new in updateLayout(new, landscape: landscape) }
+            .onChange(of: m.layoutID) { _, _ in updateLayout(screen, landscape: landscape) }
+            // A restored per-game copy can have the same layout ID, but have
+            // been saved on a different canvas. Geometry equality stops loops.
+            .onChange(of: m.controls) { _, _ in updateLayout(screen, landscape: landscape) }
+            .onChange(of: library.current) { _, _ in updateLayout(screen, landscape: landscape) }
+            .onChange(of: m.sizeScale) { _, _ in updateLayout(screen, landscape: landscape) }
             .onChange(of: m.visible) { _, _ in configureGamepad(landscape: landscape) }
             .onChange(of: zones.padZoneIDs) { _, _ in configureGamepad(landscape: landscape) }
             .onChange(of: m.selected) { _, new in if new != nil { zones.selected = nil } }
-            .onChange(of: m.editing) { _, _ in configureGamepad(landscape: landscape) }
+            .onChange(of: m.editing) { _, _ in updateLayout(screen, landscape: landscape) }
             .onChange(of: library.blocksGameplayTouch) { _, _ in configureGamepad(landscape: landscape) }
+            .onReceive(NotificationCenter.default.publisher(for: TouchControlsHost.geometryChanged)) { _ in
+                let current = presetScreen(geo)
+                updateLayout(current, landscape: current.width > current.height || session)
+            }
             .onDisappear { GamepadInput.shared.configureTouch(controls: []); TouchMouseGate.padOverlay = false }
         }
         .ignoresSafeArea()
@@ -4395,20 +4493,34 @@ struct TouchControlsOverlay: View {
                 + (GestureZonesModel.enabled ? zones.zones.filter(\.feedsPad).map(\.id) : []) : []
         // Menus and the control editor keep the pad connected but take no input (#204);
         // a touch that misses the controls is no mouse only while they do (#150).
-        let accepting = !m.editing && !library.blocksGameplayTouch
+        let accepting = m.fitsCanvas && !m.editing && !library.blocksGameplayTouch
         GamepadInput.shared.configureTouch(controls: Set(ids), acceptingInput: accepting)
         TouchMouseGate.padOverlay = accepting && !ids.isEmpty
     }
 
-    /// ml1970: with MADEIRA_CONTROLS_XBOX_DEFAULT=1, a user with no controls file gets the built-in controller
-    /// layout on the first landscape overlay, laid out for this screen (never over an existing controls file).
-    private func applyDefaultLayout(_ geo: GeometryProxy) {
-        guard m.needsDefaultLayout, geo.size.width > geo.size.height else { return }
-        let i = geo.safeAreaInsets
-        ControlPresetsModel.shared.applyDefaultIfNeeded(screen: ControlPresetScreen(
-            width: Double(geo.size.width), height: Double(geo.size.height),
-            left: Double(i.leading), right: Double(i.trailing),
-            top: Double(i.top), bottom: Double(i.bottom)))
+    private func presetScreen(_ geo: GeometryProxy) -> ControlPresetScreen {
+        let i = geo.safeAreaInsets, physical = TouchControlsHost.screen
+        return ControlPresetScreen(width: Double(geo.size.width), height: Double(geo.size.height),
+                                   left: max(Double(i.leading), physical?.left ?? 0),
+                                   right: max(Double(i.trailing), physical?.right ?? 0),
+                                   top: max(Double(i.top), physical?.top ?? 0),
+                                   bottom: max(Double(i.bottom), physical?.bottom ?? 0))
+    }
+
+    private func updateLayout(_ screen: ControlPresetScreen, landscape: Bool) {
+        guard landscape, screen.isUsable else { configureGamepad(landscape: landscape); return }
+        applyDefaultLayout(screen)
+        ControlPresetsModel.shared.reflowBuiltIn(screen: screen)
+        // Configure with the NEW IDs directly, never an empty intermediate set:
+        // release held input without disconnecting player one's controller.
+        configureGamepad(landscape: landscape)
+    }
+
+    /// With MADEIRA_CONTROLS_XBOX_DEFAULT=1, only a user without a controls file
+    /// gets the Xbox built-in once. Selecting short-edge grip stays explicit.
+    private func applyDefaultLayout(_ screen: ControlPresetScreen) {
+        guard m.needsDefaultLayout, screen.width > screen.height else { return }
+        ControlPresetsModel.shared.applyDefaultIfNeeded(screen: screen)
     }
 
     /// ml1970: while editing, a Done button ends the edit (keeping it in the
@@ -4596,6 +4708,8 @@ struct TouchControlButton: View {
     @State private var dragBase: CGPoint?
     @State private var stickDir: Int = -1
     @State private var padVector = CGSize.zero
+    @GestureState private var dragging = false
+    @State private var suppressDrag = false
 
     private var solid: Bool { TouchControlStyle.isSolid(style) }
     private var diameter: CGFloat { TouchControlsModel.diameter(control) }
@@ -4729,17 +4843,23 @@ struct TouchControlButton: View {
                 }
             }
         }
-        .onDisappear { if control.action.isPad { padVector = .zero; isDown = false } }
-        .onChange(of: m.editing) { _, _ in if control.action.isPad { padVector = .zero; isDown = false } }
-        .onChange(of: screen) { _, _ in if control.action.isPad { padVector = .zero; isDown = false } }
-        .onChange(of: control.action) { old, new in
-            if old.isPad || new.isPad { padVector = .zero; isDown = false }
+        .onDisappear { cancelInput() }
+        .onChange(of: m.editing) { _, _ in cancelInput() }
+        .onChange(of: screen) { _, _ in cancelInput() }
+        .onChange(of: control.action) { old, _ in cancelInput(action: old) }
+        .onChange(of: dragging) { _, active in
+            // GestureState also resets on cancellation, when onEnded is absent.
+            if !active { cancelInput(); suppressDrag = false }
         }
+        .onReceive(NotificationCenter.default.publisher(for: TouchControlsHost.geometryChanged)) { _ in cancelInput() }
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.willResignActiveNotification)) { _ in cancelInput() }
         .position(x: CGFloat(control.nx) * screen.width,
                   y: CGFloat(control.ny) * screen.height)
         .gesture(
             DragGesture(minimumDistance: 0)
+                .updating($dragging) { _, active, _ in active = true }
                 .onChanged { v in
+                    guard !suppressDrag else { return }
                     if m.editing {
                         m.selected = control.id
                         guard control.locked != true, let i = m.index(of: control.id) else { return }
@@ -4756,7 +4876,10 @@ struct TouchControlButton: View {
                     }
                 }
                 .onEnded { _ in
+                    let cancelled = suppressDrag
+                    suppressDrag = false
                     dragBase = nil
+                    guard !cancelled else { return }
                     if m.editing {
                         guard let i = m.index(of: control.id) else { return }
                         if m.snapToGrid {
@@ -4815,13 +4938,26 @@ struct TouchControlButton: View {
         stickDir = next
     }
 
+    /// Window and safe-area changes do not always cancel SwiftUI's drag. Drop
+    /// held keys/mouse buttons and ignore that old gesture until its lifetime
+    /// ends, just as the UIKit pad and zone surfaces discard their finger owners.
+    private func cancelInput(action: ControlAction? = nil) {
+        let action = action ?? control.action
+        if let q = action.stickKeys { applyStick(-1, q) }
+        else if isDown { press(false, action: action) }
+        isDown = false
+        padVector = .zero
+        dragBase = nil
+        suppressDrag = dragging
+    }
+
     /// Haptic on the DOWN edge only — a held movement key would otherwise buzz
     /// continuously for as long as you walk.
-    private func press(_ down: Bool) {
+    private func press(_ down: Bool, action: ControlAction? = nil) {
         if down && TouchControlsModel.shared.hapticsEnabled {
             UIImpactFeedbackGenerator(style: .light).impactOccurred()
         }
-        switch control.action {
+        switch action ?? control.action {
         case .key(let vk):
             winios_post_key(vk, down ? 1 : 0)
         case .mouseLeft:

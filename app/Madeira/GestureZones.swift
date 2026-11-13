@@ -32,6 +32,7 @@ final class GestureZonesModel: ObservableObject {
     private var saveWork: DispatchWorkItem?
     private func scheduleSave() {
         guard !loading else { return }
+        TouchControlsModel.shared.preserveEditedBuiltIn()
         saveWork?.cancel()
         let w = DispatchWorkItem { [weak self] in self?.save() }
         saveWork = w
@@ -110,6 +111,8 @@ final class GestureZoneView: UIView {
         backgroundColor = .clear
         NotificationCenter.default.addObserver(self, selector: #selector(interrupted),
             name: UIApplication.willResignActiveNotification, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(interrupted),
+            name: TouchControlsHost.geometryChanged, object: nil)
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
     deinit { NotificationCenter.default.removeObserver(self) }
@@ -125,6 +128,7 @@ final class GestureZoneView: UIView {
         for f in fingers.values { release(f) }
         fingers.removeAll()
         driver = nil
+        carryX = 0; carryY = 0
     }
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {

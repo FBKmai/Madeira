@@ -134,6 +134,10 @@ final class TouchPadView: UIView {
         backgroundColor = .clear
         NotificationCenter.default.addObserver(self, selector: #selector(interrupted),
             name: UIApplication.willResignActiveNotification, object: nil)
+        // A custom layout retains its control IDs during a resize. Invalidate
+        // its finger owners too, so a delayed move cannot restore an old hold.
+        NotificationCenter.default.addObserver(self, selector: #selector(interrupted),
+            name: TouchControlsHost.geometryChanged, object: nil)
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
     deinit { NotificationCenter.default.removeObserver(self) }

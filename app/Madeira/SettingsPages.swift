@@ -20,23 +20,23 @@ enum SettingsPages {
 
         var title: String {
             switch self {
-            case .steam: return "Steam and Dock"
+            case .steam: return L("Steam and Dock")
             case .gog: return "GOG"
             case .itch: return "itch.io"
             case .epic: return "Epic Games"
             case .ea: return "EA app"
-            case .runtimes: return "Runtimes"
-            case .graphics: return "Graphics"
-            case .display: return "Display"
-            case .memory: return "Memory and sync"
-            case .pointer: return "Pointer and touch"
+            case .runtimes: return L("Runtimes")
+            case .graphics: return L("Graphics")
+            case .display: return L("Display")
+            case .memory: return L("Memory and sync")
+            case .pointer: return L("Pointer and touch")
             case .jit: return "JIT"
-            case .signing: return "Signing"
-            case .saves: return "Saves and backups"
-            case .drives: return "External drives"
-            case .appearance: return "Appearance"
-            case .advanced: return "Advanced"
-            case .credits: return "Credits"
+            case .signing: return L("Signing")
+            case .saves: return L("Saves and backups")
+            case .drives: return L("External drives")
+            case .appearance: return L("Appearance")
+            case .advanced: return L("Advanced")
+            case .credits: return L("Credits")
             }
         }
 
@@ -80,9 +80,9 @@ enum SettingsPages {
 
     /// The rows of the Settings tab, in groups.
     static let groups: [(String?, [Page])] = [
-        ("Getting games", [.steam, .gog, .itch, .epic, .ea, .runtimes]),
-        ("Running games", [.graphics, .display, .memory, .pointer]),
-        ("Device", [.jit, .signing, .saves, .drives]),
+        (L("Getting games"), [.steam, .gog, .itch, .epic, .ea, .runtimes]),
+        (L("Running games"), [.graphics, .display, .memory, .pointer]),
+        (L("Device"), [.jit, .signing, .saves, .drives]),
         (nil, [.appearance, .advanced, .credits]),
     ]
 }
@@ -119,8 +119,8 @@ struct SettingsPagesList: View {
 
     private func summary(_ page: SettingsPages.Page) -> String? {
         switch page {
-        case .jit: return jitState.enabled ? "On" : "Off"
-        case .appearance: return liquidMetal.on ? "Liquid metal" : "Liquid Glass"
+        case .jit: return jitState.enabled ? L("On") : L("Off")
+        case .appearance: return liquidMetal.on ? L("Liquid metal") : "Liquid Glass"
         default: return nil
         }
     }
@@ -206,7 +206,7 @@ struct SettingsPageView: View {
         }
         Section {
             Picker("Touch control buttons", selection: $controlStyle) {
-                ForEach(TouchControlStyle.styles, id: \.id) { Text($0.name).tag($0.id) }
+                ForEach(TouchControlStyle.styles, id: \.id) { Text(TouchControlStyle.localizedName($0.name)).tag($0.id) }
             }
         } footer: {
             Text("Glass is the system's Liquid Glass. Solid draws each button as a plain opaque disc; a game's Opacity slider still fades them.")

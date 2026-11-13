@@ -19,6 +19,14 @@ enum JITMethod: String, CaseIterable, Identifiable {
         case .builtIn: return "Built-in StikJIT"
         }
     }
+    /// Keep `title` in English for diagnostics; only the picker uses this text.
+    var localizedTitle: String {
+        switch self {
+        case .automatic: return L("Automatic")
+        case .stikDebug: return "StikDebug"
+        case .builtIn: return L("Built-in StikJIT")
+        }
+    }
 }
 
 /// Where Built-in StikJIT's pairing file came from.
@@ -170,7 +178,7 @@ final class JITCoordinator: ObservableObject {
             case .vpn:
                 return L("Madeira couldn't reach this device. Connect LocalDevVPN, then try again.")
             case .pairing:
-                return "This device closed the connection, which usually means it no longer accepts Madeira's pairing. Pair again, and check that LocalDevVPN is connected."
+                return L("This device closed the connection, which usually means it no longer accepts Madeira's pairing. Pair again, and check that LocalDevVPN is connected.")
             }
         }
     }
@@ -259,10 +267,10 @@ final class JITCoordinator: ObservableObject {
                                        vpnWasUp ? 1 : 0, probe.detail))
             self?.loopbackAnswered = probe.reachable
             guard let self, !probe.reachable, JITNetworkShortcut.shared.enabled else { proceed(false); return }
-            status = "Running the \(JITNetworkShortcut.name) shortcut…"
+            status = String(format: L("Running the %@ shortcut…"), JITNetworkShortcut.name)
             JITNetworkShortcut.shared.start { [weak self] outcome in
                 if case .failed(let why) = outcome {
-                    stopped("Your \(JITNetworkShortcut.name) shortcut stopped: \(why) Check its steps in Shortcuts, then try again.")
+                    stopped(String(format: L("Your %@ shortcut stopped: %@ Check its steps in Shortcuts, then try again."), JITNetworkShortcut.name, why))
                     return
                 }
                 // LocalDevVPN's Connect returns before its tunnel routes (about 5 s
@@ -286,12 +294,12 @@ final class JITCoordinator: ObservableObject {
     func connectWithShortcut() {
         busy = true
         error = nil
-        status = "Running the \(JITNetworkShortcut.name) shortcut…"
+        status = String(format: L("Running the %@ shortcut…"), JITNetworkShortcut.name)
         JITNetworkShortcut.shared.start { [weak self] outcome in
             if case .failed(let why) = outcome {
                 self?.busy = false
                 self?.status = nil
-                self?.error = "The \(JITNetworkShortcut.name) shortcut did not run: \(why)."
+                self?.error = String(format: L("The %@ shortcut did not run: %@."), JITNetworkShortcut.name, why)
                 return
             }
             LoopbackProbe.waitUntilReachable(within: 15) { [weak self] probe in
@@ -542,7 +550,7 @@ struct JITSettingsSection: View {
         Section {
             Picker("JIT method", selection: $coordinator.method) {
                 ForEach(JITMethod.allCases) { method in
-                    Text(method.title).tag(method)
+                    Text(method.localizedTitle).tag(method)
                 }
             }
             Button {
@@ -601,7 +609,7 @@ struct JITSetupView: View {
                 Section {
                     Picker("Method", selection: $coordinator.method) {
                         ForEach(JITMethod.allCases) { method in
-                            Text(method.title).tag(method)
+                            Text(method.localizedTitle).tag(method)
                         }
                     }
                     if coordinator.method == .automatic {
@@ -611,7 +619,7 @@ struct JITSetupView: View {
                     LabeledContent("StikDebug",
                                    value: StikJITHelper.isAvailable ? L("Installed") : L("Not detected"))
                     LabeledContent("Built-in helper",
-                                   value: MadeiraBuiltInJIT.isAvailable ? "Available" : "Unavailable")
+                                   value: MadeiraBuiltInJIT.isAvailable ? L("Available") : L("Unavailable"))
                 } header: {
                     Text("JIT method")
                 } footer: {
@@ -636,8 +644,8 @@ struct JITSetupView: View {
                         Text("Built-in StikJIT")
                     } footer: {
                         Text(OnDevicePairing.isSupported
-                             ? "Pair in Madeira or import a pairing file made on a computer, connect LocalDevVPN, then check setup. The pairing file is kept in this device's Keychain."
-                             : "Import this device's pairing file, connect LocalDevVPN, then check setup. The pairing file is kept in this device's Keychain. Pairing in Madeira needs iOS 27 or later.")
+                             ? L("Pair in Madeira or import a pairing file made on a computer, connect LocalDevVPN, then check setup. The pairing file is kept in this device's Keychain.")
+                             : L("Import this device's pairing file, connect LocalDevVPN, then check setup. The pairing file is kept in this device's Keychain. Pairing in Madeira needs iOS 27 or later."))
                     }
 
                     Section {
@@ -663,7 +671,7 @@ struct JITSetupView: View {
                 }
 
                 if coordinator.busy {
-                    Section { HStack { ProgressView(); Text(coordinator.status ?? "Working…") } }
+                    Section { HStack { ProgressView(); Text(coordinator.status ?? L("Working…")) } }
                 } else if let error = coordinator.error {
                     Section {
                         Label(error, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.red)

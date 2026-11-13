@@ -6,7 +6,7 @@ import subprocess
 import tempfile
 
 root = Path(__file__).resolve().parents[2]
-source = (root / 'app/Madeira/TouchGamepad.swift').read_text()
+source = (root / 'app/Madeira/TouchGamepad.swift').read_text(encoding='utf-8')
 pure = source.split('// MARK: - Pure touch state', 1)[1].split('// MARK: - UIKit touch lifetime', 1)[0]
 pure = pure[pure.index('struct GamepadSample'):]
 tests = r'''
@@ -109,6 +109,6 @@ print("PASS: touch mappings, independent holds, lifecycle clearing, analogue ran
 '''
 with tempfile.TemporaryDirectory(prefix='madeira-touch-pad-') as tmp:
     src, exe = Path(tmp) / 'main.swift', Path(tmp) / 'check'
-    src.write_text('import Foundation\n' + pure + tests)
+    src.write_text('import Foundation\n' + pure + tests, encoding='utf-8')
     subprocess.run([os.environ.get('SWIFTC', 'swiftc'), str(src), '-o', str(exe)], check=True)
     subprocess.run([str(exe)], check=True)

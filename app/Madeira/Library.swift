@@ -226,6 +226,9 @@ struct LibraryEntry: Codable, Identifiable {
     /// Session menu shows it and an edit is written back to it; nil for controls
     /// no layout holds. Older files have none.
     var controlLayout: String?
+    /// Only copies saved with edit-time provenance tracking may auto-reflow.
+    /// A legacy built-in ID might still contain the user's unfinished edits.
+    var adaptiveControlLayout: Bool?
     /// The game's gesture zones (GestureZones.swift), kept with its controls. Older files have none.
     var zones: [GestureZone]?
     var lastPlayed: Date?
@@ -1736,7 +1739,8 @@ final class LibraryModel: ObservableObject {
             // The game's controls come with the layout they were loaded from (if that
             // layout still exists), so a later edit is not written to another game's.
             if ControlPresetsModel.enabled {
-                controls.layoutID = ControlPresetsModel.shared.store.resolvedID(entry.controlLayout)
+                controls.layoutID = ControlPresetsModel.shared.store.resolvedID(
+                    ControlPresetStore.restoredID(entry.controlLayout, adaptive: entry.adaptiveControlLayout))
             }
         }
         controls.visible = entry.touchControls
@@ -1890,7 +1894,10 @@ final class LibraryModel: ObservableObject {
         if let id = current, var entry = entries.first(where: { $0.id == id }) {
             entry.controls = controls.controls
             entry.zones = GestureZonesModel.shared.zones
-            if ControlPresetsModel.enabled { entry.controlLayout = controls.layoutID }
+            if ControlPresetsModel.enabled {
+                entry.controlLayout = controls.layoutID
+                entry.adaptiveControlLayout = true
+            }
             entry.touchControls = controls.visible
             entry.fpsMode = fpsMode; entry.performance = performance
             entry.overlayFields = overlayFields
@@ -1909,14 +1916,14 @@ final class LibraryModel: ObservableObject {
         if sawProcess, let next = steamRunRequest() { restartNotice = next }
         else if sawProcess, let report = exitReport() { error = report }
         timer?.invalidate(); timer = nil
+        let controls = TouchControlsModel.shared
+        controls.editing = false; controls.selected = nil
         saveCurrentProfile()
         controllerMode = nil
         controllerBinds = [:]
         padMouseVertical = 1
         padAssist = nil
         GamepadInput.shared.setPadAssist(nil)
-        let controls = TouchControlsModel.shared
-        controls.editing = false; controls.selected = nil
         controls.controls = savedControls; controls.visible = savedVisible; controls.sizeScale = savedSize
         GestureZonesModel.shared.selected = nil; GestureZonesModel.shared.zones = savedZones
         if ControlPresetsModel.enabled { controls.layoutID = savedLayout }
@@ -4017,7 +4024,7 @@ struct LibraryDetail: View {
     /// "None", or how many keys this game's own config sets.
     static func configSummary(_ config: String?) -> String {
         let count = MadeiraConfig.parse(config ?? "").count
-        return count == 0 ? "None" : count == 1 ? "1 setting" : "\(count) settings"
+        return count == 0 ? L("None") : String(format: L("Settings: %@"), String(count))
     }
     private func start() {
         guard !leaving else { return }
@@ -4100,19 +4107,19 @@ struct LibraryDetail: View {
         case display, controls, launch, compatibility, steam, cloud, achievements, gog, itch, library, iniFiles, advanced
         var title: String {
             switch self {
-            case .display: return "Display"
-            case .controls: return "Controls"
-            case .launch: return "Launch"
-            case .compatibility: return "Compatibility"
+            case .display: return L("Display")
+            case .controls: return L("Controls")
+            case .launch: return L("Launch")
+            case .compatibility: return L("Compatibility")
             case .steam: return "Steam"
             case .cloud: return "Steam Cloud"
             case .workshop: return "Steam Workshop"
             case .gog: return "GOG"
             case .itch: return "itch.io"
-            case .achievements: return "Achievements"
-            case .library: return "Library details"
-            case .iniFiles: return "Settings files"
-            case .advanced: return "Advanced"
+            case .achievements: return L("Achievements")
+            case .library: return L("Library details")
+            case .iniFiles: return L("Settings files")
+            case .advanced: return L("Advanced")
             }
         }
         var symbol: String {
@@ -4157,13 +4164,15 @@ struct LibraryDetail: View {
     private func summary(_ page: Page) -> String? {
         switch page {
         case .display: return entry.metalFXUpscale.map { "\(entry.resolution) · MetalFX \($0 == 2 ? "2" : "1.5")×" } ?? entry.resolution
-        case .controls: return entry.controllerMode == "keys" ? "Keyboard and mouse" : entry.controllerMode == "dinput" ? "XInput and DirectInput" : nil
+        case .controls:
+            return entry.controllerMode == "keys" ? L("Keyboard and mouse")
+                : entry.controllerMode == "dinput" ? L("XInput and DirectInput") : nil
         case .launch: return entry.usesLaunchOptions ? (entry.runsInDesktop ? L("Wine desktop") : L("Directly")) : nil
-        case .steam: return entry.startsSteamGameDirectly ? "The game" : "Madeira Dock"
+        case .steam: return entry.startsSteamGameDirectly ? L("The game") : "Madeira Dock"
         case .advanced: return Self.configSummary(bcd.configText)   // madeira-bcd: the game's own config file
         case .iniFiles:
             let count = GameIniFiles.files(entry.windowsPath).count
-            return count == 0 ? nil : count == 1 ? "1 file" : "\(count) files"
+            return count == 0 ? nil : String(format: L("Files: %@"), String(count))
         default: return nil
         }
     }
@@ -4200,21 +4209,21 @@ struct LibraryDetail: View {
             let metalFX = ResolutionChoices.metalFX(in: groups)
             Picker("Resolution", selection: $entry.resolution) {
                 ForEach(groups, id: \.title) { group in
-                    Section(group.title) {
-                        ForEach(group.choices, id: \.value) { Text($0.label).tag($0.value) }
+                    Section(ResolutionChoices.localizedLabel(group.title)) {
+                        ForEach(group.choices, id: \.value) { Text(ResolutionChoices.localizedLabel($0.label)).tag($0.value) }
                     }
                 }
                 // The screen's shape at 480 lines, which MetalFX 1.5× brings to 720.
                 if let shape = metalFX, entry.metalFXUpscale == 1.5 || entry.resolution == shape.value {
-                    Text(shape.label).tag(shape.value)
+                    Text(ResolutionChoices.localizedLabel(shape.label)).tag(shape.value)
                 }
                 // A size none of them has, so the picker never shows a blank choice.
                 if entry.resolution != metalFX?.value, let saved = ResolutionChoices.extra(entry.resolution, in: groups, note: "saved") {
-                    Text(saved.label).tag(entry.resolution)
+                    Text(ResolutionChoices.localizedLabel(saved.label)).tag(entry.resolution)
                 }
             }
             Picker("Aspect & scaling", selection: Binding(get: { entry.displayMode.rawValue }, set: { entry.display = $0 })) {
-                ForEach(DisplayMode.allCases, id: \.rawValue) { Text($0.label).tag($0.rawValue) }
+                ForEach(DisplayMode.allCases, id: \.rawValue) { Text($0.localizedLabel).tag($0.rawValue) }
             }
             // Every setting here is the Desktop's too: its programs present through
             // the same path, and its launch applies them like a game's
@@ -5457,6 +5466,51 @@ struct SessionMenuBackground: ViewModifier {
     }
 }
 
+// Display-only names. DisplayMode and ResolutionChoices stay Foundation-only, and
+// the identifiers, sizes and English field names used in saved profiles stay unchanged.
+extension DisplayMode {
+    var localizedLabel: String {
+        switch self {
+        case .fit: return L("Fit")
+        case .fill: return L("Fill")
+        case .stretch: return L("Stretch")
+        case .aspect: return L("Aspect")
+        }
+    }
+}
+
+extension ResolutionChoices {
+    static func localizedLabel(_ text: String) -> String {
+        text.components(separatedBy: " · ").map { part in
+            switch part {
+            case "This screen's shape": return L("This screen's shape")
+            case "16:9 widescreen": return L("16:9 widescreen")
+            case "4:3 classic": return L("4:3 classic")
+            case "fills this screen": return L("fills this screen")
+            case "bars above and below": return L("bars above and below")
+            case "bars at the sides": return L("bars at the sides")
+            case "light": return L("light")
+            case "default": return L("default")
+            case "720 lines": return L("720 lines")
+            case "native": return L("native")
+            case "for MetalFX 1.5×": return L("for MetalFX 1.5×")
+            case "saved": return L("saved")
+            default: return part
+            }
+        }.joined(separator: " · ")
+    }
+}
+
+extension TouchControlStyle {
+    static func localizedName(_ name: String) -> String {
+        switch name {
+        case "Glass": return L("Glass")
+        case "Solid": return L("Solid")
+        default: return name
+        }
+    }
+}
+
 /// The performance overlay's look (OverlayStyle), under its figures in the in-game menu.
 struct OverlayStyleSettings: View {
     @AppStorage(OverlayStyle.layoutKey) private var layout = "grid"
@@ -5471,13 +5525,13 @@ struct OverlayStyleSettings: View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Overlay style").font(.subheadline.weight(.semibold)).padding(.top, 4)
             Picker("Layout", selection: $layout) {
-                ForEach(OverlayStyle.layouts, id: \.id) { Text($0.name).tag($0.id) }
+                ForEach(OverlayStyle.layouts, id: \.id) { Text(OverlayStyle.localizedName($0.name)).tag($0.id) }
             }.pickerStyle(.segmented)
             LabeledContent("Size") { Slider(value: $scale, in: 0.6...1.8, step: 0.05) }
             LabeledContent("Opacity") { Slider(value: $opacity, in: 0.3...1) }
             LabeledContent("Background") {
                 Picker("Background", selection: $background) {
-                    ForEach(OverlayStyle.backgrounds, id: \.id) { Text($0.name).tag($0.id) }
+                    ForEach(OverlayStyle.backgrounds, id: \.id) { Text(OverlayStyle.localizedName($0.name)).tag($0.id) }
                 }.pickerStyle(.segmented).frame(maxWidth: 220)
             }
             Toggle("Labels", isOn: $labels)
@@ -5960,11 +6014,11 @@ struct LibraryHUD: View {
                     }
                 }
                 LabeledContent("Opacity") { Slider(value: $model.opacity, in: 0.15...1) }
-                LabeledContent("Size") { Slider(value: $controls.sizeScale, in: 0.5...2) }
+                LabeledContent("Size") { Slider(value: $controls.sizeScale, in: 0.5...controls.sizeLimit) }
                 // Glass or an opaque disc (TouchControlStyle); the same choice as Settings › Appearance.
                 LabeledContent("Button style") {
                     Picker("Button style", selection: $controlStyle) {
-                        ForEach(TouchControlStyle.styles, id: \.id) { Text($0.name).tag($0.id) }
+                        ForEach(TouchControlStyle.styles, id: \.id) { Text(TouchControlStyle.localizedName($0.name)).tag($0.id) }
                     }.pickerStyle(.segmented).frame(maxWidth: 220)
                 }
                 Button("Edit controls", systemImage: "slider.horizontal.3") { controls.visible = true; controls.editing = true; model.menu = false }
@@ -5989,7 +6043,7 @@ struct LibraryHUD: View {
                 if sessionTools {
                     LabeledContent("Aspect & scaling") {
                         Picker("Aspect & scaling", selection: $model.displayMode) {
-                            ForEach(DisplayMode.allCases, id: \.self) { mode in Label(mode.label, systemImage: mode.symbol).tag(mode) }
+                            ForEach(DisplayMode.allCases, id: \.self) { mode in Label(mode.localizedLabel, systemImage: mode.symbol).tag(mode) }
                         }.pickerStyle(.menu).labelsHidden()
                     }
                 }
@@ -6006,7 +6060,7 @@ struct LibraryHUD: View {
                 Toggle("Performance overlay", isOn: $model.performance)
                 if model.performance {
                     ForEach(OverlayStyle.fields, id: \.self) { field in
-                        Toggle(field, isOn: Binding(get: { model.overlayFields.contains(field) }, set: { on in
+                        Toggle(OverlayStyle.localizedName(field), isOn: Binding(get: { model.overlayFields.contains(field) }, set: { on in
                             model.overlayFields.removeAll { $0 == field }; if on { model.overlayFields.append(field) }
                         })).font(.subheadline)
                     }
@@ -6106,6 +6160,27 @@ enum OverlayStyle {
     static let backgrounds: [(id: String, name: String)] = [("glass", "Glass"), ("dark", "Dark"), ("clear", "None")]
     /// The figures the overlay can show, in the order of the menu's switches.
     static let fields = ["FPS", "Frame time", "1% lows", "0.1% lows", "Frame graph", "CPU", "GPU", "RAM", "JIT memory", "Swap & donor", "Battery", "Thermal"]
+
+    /// Only the visible labels are translated; `fields` and the picker IDs are stored.
+    static func localizedName(_ name: String) -> String {
+        switch name {
+        case "Grid": return L("Grid")
+        case "One row": return L("One row")
+        case "Column": return L("Column")
+        case "Glass": return L("Glass")
+        case "Dark": return L("Dark")
+        case "None": return L("None")
+        case "Frame time": return L("Frame time")
+        case "1% lows": return L("1% lows")
+        case "0.1% lows": return L("0.1% lows")
+        case "Frame graph": return L("Frame graph")
+        case "JIT memory": return L("JIT memory")
+        case "Swap & donor": return L("Swap & donor")
+        case "Battery": return L("Battery")
+        case "Thermal": return L("Thermal")
+        default: return name
+        }
+    }
 }
 
 /// Frame times from the present path (madeira_frame_times_us, Winios.m) and the

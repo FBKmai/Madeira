@@ -9,7 +9,7 @@ import UIKit
 // own layouts ("Custom Layout 1", "Custom Layout 2", ...) are kept app-wide in
 // Documents/madeira-control-presets.json, beside madeira-controls.json, so a
 // device backup carries them. Built-ins ship in code and can be loaded but
-// never changed: there is one, a full XInput layout named "Xbox controller".
+// never changed: "Xbox controller" and "Short-edge grip" both map full XInput.
 //
 // madeira-controls.json stays the working copy the overlay draws; it records
 // which layout it was loaded from (`TouchControlsModel.layoutID`) so edits made
@@ -93,7 +93,14 @@ struct ControlPresetScreen: Equatable {
     var height: Double
     var left = 0.0, right = 0.0, top = 0.0, bottom = 0.0
 
-    /// The overlay is landscape-only, so a portrait screen is laid out as the
+    /// Ignore zero/transitional window geometry rather than replacing a layout.
+    var isUsable: Bool {
+        [width, height, left, right, top, bottom].allSatisfy { $0.isFinite }
+            && left >= 0 && right >= 0 && top >= 0 && bottom >= 0
+            && width > left + right && height > top + bottom
+    }
+
+    /// The legacy Xbox layout is landscape-only, so a portrait screen is laid out as the
     /// landscape one it rotates to: the top/bottom insets move to the sides.
     var landscape: ControlPresetScreen {
         guard height > width else { return self }
@@ -111,6 +118,8 @@ struct ControlPresetScreen: Equatable {
 enum ControlPresetLayout {
     static let xboxID = "builtin.xbox"
     static let xboxName = "Xbox controller"
+    static let shortEdgeID = "builtin.short-edge"
+    static let shortEdgeName = "Short-edge grip"
     /// Mirrors `TouchControlsModel.baseDiameter`.
     static let baseDiameter = 64.0
 
@@ -122,16 +131,61 @@ enum ControlPresetLayout {
     /// The overlay's own buttons, centred at the top (TouchControlsModel.
     /// hitsInteractive claims this band). A built-in leaves it free.
     static func topBarRect(_ s: ControlPresetScreen) -> CGRect {
-        CGRect(x: s.width / 2 - 100, y: 0, width: 200, height: 76)
+        // Four 44pt buttons, three 10pt gaps, plus the window's 10pt hit slop.
+        CGRect(x: s.width / 2 - 113, y: 0, width: 226, height: 76)
     }
 
     /// The drawn bounding box, in points: `baseDiameter` × the control's scale
     /// for a round button, the pad button's own shape otherwise (a wide
     /// shoulder, a Start/Select pill), centred on its normalised position.
-    static func box(_ c: TouchControl, screen s: ControlPresetScreen) -> CGRect {
-        let z = c.action.controlSize(diameter: CGFloat(baseDiameter * c.scale))
+    /// `sizeScale` is the session-wide control-size slider; built-in layouts use
+    /// this helper to cap that slider before enlarged controls can collide.
+    static func box(_ c: TouchControl, screen s: ControlPresetScreen, sizeScale: Double = 1) -> CGRect {
+        let d = baseDiameter * c.scale * (sizeScale.isFinite ? sizeScale : 1)
+        let z = c.action.controlSize(diameter: CGFloat(d))
         return CGRect(x: c.nx * s.width - Double(z.width) / 2, y: c.ny * s.height - Double(z.height) / 2,
                       width: Double(z.width), height: Double(z.height))
+    }
+
+    /// Test the actual drawn sizes, not just the centres. The editor's minimum
+    /// size is not proof that a layout fits a very small resized window.
+    static func fits(_ controls: [TouchControl], screen s: ControlPresetScreen, sizeScale: Double) -> Bool {
+        guard s.isUsable, !controls.isEmpty, sizeScale.isFinite, sizeScale >= 0.5 else { return false }
+        let m = margins(s)
+        let safe = CGRect(x: m.left, y: m.top, width: s.width - m.left - m.right,
+                          height: s.height - m.top - m.bottom)
+        let boxes = controls.map { box($0, screen: s, sizeScale: sizeScale) }
+        guard boxes.allSatisfy({ safe.contains($0) }),
+              !boxes.contains(where: { $0.intersects(topBarRect(s)) }) else { return false }
+        for i in boxes.indices {
+            for j in boxes.indices where j > i {
+                let a = boxes[i], b = boxes[j]
+                let round = abs(a.width - a.height) < 0.001 && abs(b.width - b.height) < 0.001
+                if round {
+                    let dx = a.midX - b.midX, dy = a.midY - b.midY
+                    if (dx * dx + dy * dy).squareRoot() < a.width / 2 + b.width / 2 + 2 { return false }
+                } else if a.insetBy(dx: -1, dy: -1).intersects(b) {
+                    return false
+                }
+            }
+        }
+        return true
+    }
+
+    /// Largest session-wide size that keeps a pristine built-in inside the
+    /// actual canvas, away from the overlay menu, and mutually separated. A
+    /// game's Control size is a multiplier applied after a layout is loaded;
+    /// without this cap a perfectly fitted foldable layout can overlap when a
+    /// player chooses 150% or 200%.
+    static func maximumSizeScale(for controls: [TouchControl], screen s: ControlPresetScreen) -> Double {
+        guard s.isUsable, !controls.isEmpty else { return 2 }
+        guard fits(controls, screen: s, sizeScale: 0.5) else { return 0.5 }
+        var lo = 0.5, hi = 2.0
+        for _ in 0..<24 {
+            let mid = (lo + hi) / 2
+            if fits(controls, screen: s, sizeScale: mid) { lo = mid } else { hi = mid }
+        }
+        return lo
     }
 
     /// The built-in controller layout, using the editor's controller mappings:
@@ -227,6 +281,102 @@ enum ControlPresetLayout {
         add("R3", clickScale, rStickX - stick / 2 - 20 * k - click / 2, clickY)
         return out
     }
+
+    struct ShortEdgeFit {
+        var left: Double, trailing: Double, top: Double, bottom: Double
+        var scale: Double
+        /// The requested overall control size, capped by the available canvas.
+        /// Keep this separate from per-control scales so the editor's 0.5 clamp
+        /// cannot enlarge a fitted button back into its neighbours.
+        var sizeScale: Double
+    }
+
+    static func shortEdgeFit(for s: ControlPresetScreen, sizeScale: Double = 1) -> ShortEdgeFit? {
+        guard s.isUsable else { return nil }
+        let m = margins(s)
+        let left = max(m.left, s.width * 0.03), trailing = max(m.right, s.width * 0.03)
+        let bottom = max(m.bottom, s.height * 0.03), top = max(m.top, s.height * 0.03)
+        let width = s.width - left - trailing
+        guard width > 0 else { return nil }
+        // Try both sides of the menu and below it. Pick the region with the
+        // most room BEFORE capping the default size, so enlarging the controls
+        // can use the same safe fit instead of growing into the menu.
+        let clusterWidth = 199.8
+        let widthScale = (width - 2) / (2 * clusterWidth)
+        let bar = topBarRect(s).insetBy(dx: -10, dy: 0)
+        let beside = min(widthScale, min((s.height - top - bottom) / 384,
+                         min((Double(bar.minX) - left) / clusterWidth,
+                             (s.width - trailing - Double(bar.maxX)) / clusterWidth)))
+        let belowTop = max(top, Double(bar.maxY) + 8)
+        let below = min(widthScale, (s.height - belowTop - bottom) / 384)
+        let limit = max(beside, below)
+        let scale = min(1.15, limit)
+        guard scale >= 0.5 / 0.7 else { return nil }
+        let requested = sizeScale.isFinite ? min(max(sizeScale, 0.5), 2) : 1
+        return ShortEdgeFit(left: left, trailing: trailing,
+                            top: beside >= below ? top : belowTop, bottom: bottom,
+                            scale: scale, sizeScale: min(requested, limit / scale))
+    }
+
+    /// Two bounded thumb clusters, centred vertically instead of stretching
+    /// from the top to the bottom of a tall unfolded display. Uses the ACTUAL
+    /// canvas, including portrait sessions; no device or hinge assumptions.
+    static func shortEdge(for s: ControlPresetScreen, sizeScale: Double = 1) -> [TouchControl] {
+        guard let fit = shortEdgeFit(for: s, sizeScale: sizeScale) else { return [] }
+        let k = fit.scale * fit.sizeScale
+        let height = s.height - fit.top - fit.bottom
+        let y0 = fit.top + (height - 384 * k) / 2
+        var out: [TouchControl] = []
+        func add(_ name: String, _ scale: Double, _ x: Double, _ y: Double, right: Bool = false) {
+            var c = TouchControl()
+            c.action = .pad(name)
+            // `fit.sizeScale` is applied by TouchControlsModel's shared size
+            // multiplier. Do not bake it into each control as well, or a 150%
+            // request would become 225% and exceed the fit we just calculated.
+            c.scale = scale * fit.scale
+            c.nx = (right ? s.width - fit.trailing - x * k : fit.left + x * k) / s.width
+            c.ny = (y0 + y * k) / s.height
+            out.append(c)
+        }
+        add("LT", 0.88, 53, 30); add("LB", 0.88, 53, 80)
+        add("RT", 0.88, 53, 30, right: true); add("RB", 0.88, 53, 80, right: true)
+        add("View", 0.75, 171, 30); add("Menu", 0.75, 171, 30, right: true)
+        let arm = 50.8
+        add("D↑", 0.7, 78, 194 - arm); add("D↓", 0.7, 78, 194 + arm)
+        add("D←", 0.7, 78 - arm, 194); add("D→", 0.7, 78 + arm, 194)
+        let face = 46.96
+        add("Y", 0.78, 78, 194 - face, right: true)
+        add("A", 0.78, 78, 194 + face, right: true)
+        add("X", 0.78, 78 + face, 194, right: true)
+        add("B", 0.78, 78 - face, 194, right: true)
+        add("LS", 1.45, 78, 327); add("RS", 1.45, 78, 327, right: true)
+        add("L3", 0.7, 175, 350); add("R3", 0.7, 175, 350, right: true)
+        return out
+    }
+
+    static func sizeLimit(for id: String?, screen: ControlPresetScreen) -> Double {
+        guard screen.isUsable else { return 2 }
+        switch id {
+        case shortEdgeID:
+            return shortEdgeFit(for: screen, sizeScale: 2)?.sizeScale ?? 1
+        case xboxID:
+            return maximumSizeScale(for: xbox(for: screen), screen: screen.landscape)
+        default: return 2
+        }
+    }
+
+    static func controls(for id: String, screen: ControlPresetScreen, sizeScale: Double = 1) -> [TouchControl]? {
+        switch id {
+        case xboxID:
+            // This legacy layout is landscape-only. A small but otherwise valid
+            // window can still be too tight even at the slider's minimum size.
+            let controls = xbox(for: screen)
+            return screen.width > screen.height && fits(controls, screen: screen, sizeScale: sizeScale)
+                ? controls : []
+        case shortEdgeID: return shortEdge(for: screen, sizeScale: sizeScale)
+        default: return nil
+        }
+    }
 }
 
 /// The layout list: built-ins (read-only, in code), then the user's own
@@ -235,6 +385,8 @@ struct ControlPresetStore: Equatable {
     static let builtIns: [ControlPreset] = [
         ControlPreset(id: ControlPresetLayout.xboxID, name: ControlPresetLayout.xboxName,
                       controls: ControlPresetLayout.xbox(for: .referencePhone)),
+        ControlPreset(id: ControlPresetLayout.shortEdgeID, name: ControlPresetLayout.shortEdgeName,
+                      controls: ControlPresetLayout.shortEdge(for: .referencePhone)),
     ]
     static let maxNameLength = 40
 
@@ -251,6 +403,15 @@ struct ControlPresetStore: Equatable {
     /// The id if a layout still has it, else nil: a game's remembered layout may
     /// have been deleted since, and controls that no layout holds are unsaved.
     func resolvedID(_ id: String?) -> String? { id.flatMap { preset($0)?.id } }
+
+    /// Old files could save a modified built-in before the editor's Done
+    /// cleared its ID. An ID alone therefore is NOT permission to regenerate
+    /// those controls. Preserve ambiguous copies as unsaved, until the user
+    /// explicitly selects a built-in again. Custom layout IDs stay unchanged.
+    static func restoredID(_ id: String?, adaptive: Bool?) -> String? {
+        guard let id else { return nil }
+        return isBuiltIn(id) && adaptive != true ? nil : id
+    }
 
     static func clean(_ name: String) -> String {
         String(name.trimmingCharacters(in: .whitespacesAndNewlines).prefix(maxNameLength))
@@ -332,11 +493,13 @@ struct ControlPresetStore: Equatable {
     /// share them), positions inside the editor's drag clamp, and scales inside
     /// the pinch clamp. A built-in is laid out again for the screen it is
     /// loaded on.
-    static func layout(of p: ControlPreset, screen: ControlPresetScreen?) -> [TouchControl] {
+    static func layout(of p: ControlPreset, screen: ControlPresetScreen?, sizeScale: Double = 1) -> [TouchControl] {
         var controls = p.controls
-        if p.id == ControlPresetLayout.xboxID, let screen {
-            let fitted = ControlPresetLayout.xbox(for: screen)
-            if !fitted.isEmpty { controls = fitted }
+        if ControlPresetStore.isBuiltIn(p.id), let screen {
+            guard screen.isUsable,
+                  let fitted = ControlPresetLayout.controls(for: p.id, screen: screen, sizeScale: sizeScale),
+                  !fitted.isEmpty else { return [] }
+            controls = fitted
         }
         return controls.map { c in
             var c = c
@@ -346,6 +509,26 @@ struct ControlPresetStore: Equatable {
             c.scale = min(max(c.scale, 0.5), 3.0)
             return c
         }
+    }
+
+    /// Only a pristine built-in follows the live canvas. Custom, unsaved and
+    /// in-progress editor copies are never touched. Returning nil for unchanged
+    /// geometry also prevents an observation -> controls -> observation loop.
+    static func reflow(id: String?, controls: [TouchControl], screen: ControlPresetScreen,
+                       editing: Bool, sizeScale: Double = 1) -> [TouchControl]? {
+        guard !editing, screen.isUsable, let id, isBuiltIn(id),
+              id != ControlPresetLayout.xboxID || screen.width > screen.height,
+              let fitted = ControlPresetLayout.controls(for: id, screen: screen, sizeScale: sizeScale),
+              !fitted.isEmpty else { return nil }
+        // On a temporarily undersized canvas the overlay hides and blocks the
+        // old controls, but keeps their IDs so player one's pad stays connected.
+        // A later resize regenerates the layout without an empty intermediate set.
+        let preset = ControlPreset(id: id, name: "", controls: fitted)
+        let next = layout(of: preset, screen: nil)
+        let unchanged = controls.count == next.count && zip(controls, next).allSatisfy { a, b in
+            a.action == b.action && a.nx == b.nx && a.ny == b.ny && a.scale == b.scale
+        }
+        return unchanged ? nil : next
     }
 }
 
@@ -437,39 +620,86 @@ final class ControlPresetsModel: ObservableObject {
         }
     }
 
-    /// The landscape screen the overlay is laid out on.
+    /// Actual canvas, not an assumed device shape. The Xbox factory handles
+    /// its own landscape normalisation; short-edge grip also fits portrait.
     static func currentScreen() -> ControlPresetScreen {
-        let window = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
-            .flatMap(\.windows).first { $0.isKeyWindow }
-        guard let window, window.bounds.width > 0 else { return .referencePhone }
+        if let screen = TouchControlsHost.screen { return screen }
+        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        let scene = scenes.first { $0.activationState == .foregroundActive }
+        guard let window = scene?.windows.first(where: { $0.isKeyWindow }) else { return .referencePhone }
         let i = window.safeAreaInsets
-        let s = ControlPresetScreen(width: Double(window.bounds.width), height: Double(window.bounds.height),
-                                    left: Double(i.left), right: Double(i.right),
-                                    top: Double(i.top), bottom: Double(i.bottom))
-        return s.landscape
+        let screen = ControlPresetScreen(width: Double(window.bounds.width), height: Double(window.bounds.height),
+                                         left: Double(i.left), right: Double(i.right),
+                                         top: Double(i.top), bottom: Double(i.bottom))
+        return screen.isUsable ? screen : .referencePhone
+    }
+
+    /// Rebuild only built-ins, including old per-game copies restored at the
+    /// same window size. Fresh control IDs invalidate pre-resize finger owners.
+    func reflowBuiltIn(screen: ControlPresetScreen) {
+        let m = TouchControlsModel.shared
+        guard Self.enabled, !m.editing, let id = m.layoutID, ControlPresetStore.isBuiltIn(id) else {
+            m.fitsCanvas = true
+            return
+        }
+        guard screen.isUsable else { return }
+        let sizeScale = min(m.sizeScale, ControlPresetLayout.sizeLimit(for: id, screen: screen))
+        // Both built-ins can be temporarily too large for a compact split
+        // window. Keep their IDs and pad connection, but hide input until the
+        // window can fit a complete layout again. Do not lower the saved size
+        // just because an intermediate window cannot fit any controls.
+        guard let fitting = ControlPresetLayout.controls(for: id, screen: screen,
+                                                         sizeScale: sizeScale),
+              !fitting.isEmpty else {
+            m.fitsCanvas = false
+            return
+        }
+        m.sizeScale = sizeScale
+        m.fitsCanvas = true
+        guard let next = ControlPresetStore.reflow(id: id, controls: m.controls,
+                                                   screen: screen, editing: m.editing,
+                                                   sizeScale: m.sizeScale) else { return }
+        m.selected = nil
+        m.setControlsForGeometry(next)
     }
 
     /// Never over a layout the user already has: only when no controls file existed.
     func applyDefaultIfNeeded(screen: ControlPresetScreen) {
         let m = TouchControlsModel.shared
         guard m.needsDefaultLayout else { return }
-        let apply = defaultPending && m.controls.isEmpty
-        m.needsDefaultLayout = false
-        guard apply else { return }
-        load(ControlPresetLayout.xboxID, screen: screen, reason: "new-user-default")
+        guard defaultPending && m.controls.isEmpty else {
+            m.needsDefaultLayout = false
+            return
+        }
+        // Retry on the next overlay if this canvas cannot fit the built-in yet.
+        if load(ControlPresetLayout.xboxID, screen: screen, reason: "new-user-default") {
+            m.needsDefaultLayout = false
+        }
     }
 
-    /// Replace the on-screen layout with this one.
-    func load(_ id: String, screen: ControlPresetScreen, reason: String = "chosen") {
-        guard let p = store.preset(id) else { return }
+    /// Replace the on-screen layout with this one. False leaves the current
+    /// layout untouched, so a caller can keep or clear its source explicitly.
+    @discardableResult
+    func load(_ id: String, screen: ControlPresetScreen, reason: String = "chosen") -> Bool {
+        guard let p = store.preset(id) else { return false }
         let m = TouchControlsModel.shared
-        let controls = ControlPresetStore.layout(of: p, screen: screen)
+        let sizeScale = min(m.sizeScale, ControlPresetLayout.sizeLimit(for: p.id, screen: screen))
+        let controls = ControlPresetStore.layout(of: p, screen: screen, sizeScale: sizeScale)
+        // No safe fit at the editor's minimum size: leave the current layout
+        // intact rather than silently loading reference-phone geometry.
+        guard !ControlPresetStore.isBuiltIn(p.id) || !controls.isEmpty else {
+            log("layout does not fit current canvas id=\(p.id)")
+            return false
+        }
         m.selected = nil
+        m.sizeScale = sizeScale
+        m.fitsCanvas = true
         m.controls = controls
         GestureZonesModel.shared.selected = nil
         GestureZonesModel.shared.zones = ControlPresetStore.zones(of: p)
         m.layoutID = p.id
-        log("loaded layout=\(ControlPresetStore.isBuiltIn(p.id) ? "xbox" : "custom") controls=\(controls.count) reason=\(reason)")
+        log("loaded layout=\(ControlPresetStore.isBuiltIn(p.id) ? p.id : "custom") controls=\(controls.count) reason=\(reason)")
+        return true
     }
 
     /// Keep the unsaved on-screen controls as the next "Custom Layout N".
@@ -516,8 +746,11 @@ final class ControlPresetsModel: ObservableObject {
         log("deleted custom layout")
         let m = TouchControlsModel.shared
         if m.layoutID == id {
-            if Self.touchPad { load(ControlPresetLayout.xboxID, screen: Self.currentScreen(), reason: "deleted") }
-            else { m.layoutID = nil }
+            // A deleted layout must not stay as this copy's source: if the
+            // fallback cannot load (tiny window), the copy becomes unsaved.
+            let restored = Self.touchPad
+                && load(ControlPresetLayout.xboxID, screen: Self.currentScreen(), reason: "deleted")
+            if !restored { m.layoutID = nil }
         }
         return true
     }
@@ -545,6 +778,18 @@ final class ControlPresetsModel: ObservableObject {
 }
 
 // MARK: - Layout menu (landscape overlay, library session menu)
+
+extension ControlPreset {
+    /// Stored names and IDs stay language-independent; a user's own name is
+    /// literal text, even when it happens to match a translated catalog key.
+    var displayName: String {
+        switch id {
+        case ControlPresetLayout.xboxID: return L("Xbox controller")
+        case ControlPresetLayout.shortEdgeID: return L("Short-edge grip")
+        default: return name
+        }
+    }
+}
 
 /// The layout menu: the controller built-in, the user's custom layouts,
 /// "Create new layout" (opens the editor on an empty layout) and deleting the
@@ -611,8 +856,8 @@ struct ControlLayoutMenu: View {
             Section("Controller layout") {
                 ForEach(presets.available) { p in
                     Button { request(.load(p.id)) } label: {
-                        if m.layoutID == p.id { Label(p.name, systemImage: "checkmark") }
-                        else if ControlPresetStore.isBuiltIn(p.id) { Label(p.name, systemImage: "gamecontroller") }
+                        if m.layoutID == p.id { Label(p.displayName, systemImage: "checkmark") }
+                        else if ControlPresetStore.isBuiltIn(p.id) { Label(p.displayName, systemImage: "gamecontroller") }
                         else { Text(p.name) }
                     }
                 }
@@ -636,7 +881,7 @@ struct ControlLayoutMenu: View {
                     .background(GlassShape(circle: true))
             case .row:
                 HStack(spacing: 4) {
-                    Text(presets.active?.name ?? "Custom")
+                    Text(presets.active?.displayName ?? L("Custom"))
                     Image(systemName: "chevron.up.chevron.down").font(.caption)
                 }
             }
