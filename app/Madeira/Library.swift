@@ -3325,6 +3325,10 @@ struct LibraryView: View {
     @ObservedObject private var controller = LibraryController.shared
     @ObservedObject private var input = InputSettings.shared
     @State private var tab = 0
+    /// A foldable's window is wide in BOTH orientations (the Duo opens at about
+    /// 669x951 pt); a phone's narrow edge is under 430 pt. Only a wide window
+    /// gets the leading-side controls; nothing changes on an ordinary iPhone.
+    @State private var wideWindow = false
     // The interface the next start uses (FrontendChoice).
     @State private var developerUI = !FrontendChoice.preferNew
     @State private var restartNotice = false
@@ -3395,6 +3399,16 @@ struct LibraryView: View {
         .background(LibraryNavSearch(text: tab == 0 ? $search : $settingsSearch,
                                      placeholder: tab == 0 ? L("Search your library") : L("Search settings"))
             .frame(width: 0, height: 0))
+        // A foldable shows the system's status bar and deck widgets along the
+        // trailing edge of the display. They take the touches meant for bar
+        // buttons drawn there: the floating tab bar's two icons and the two
+        // topBarTrailing items stop responding, while taps on the library's
+        // own cards still work. Measure the WINDOW, not the screen, so split
+        // screen and folded states are each judged on their real geometry.
+        .onGeometryChange(for: CGSize.self) { $0.size } action: { size in
+            let now = min(size.width, size.height) >= 500
+            if now != wideWindow { wideWindow = now }
+        }
         // Each tab is hosted by the tab bar controller, so a toolbar set inside a tab
         // would not reach the navigation bar: the library's lives here.
         // The title is a large leading toolbar item, level with the library's
@@ -3403,6 +3417,7 @@ struct LibraryView: View {
         // which iOS 26 draws as a Liquid Glass morph between the two.
         .navigationTitle("")
         .toolbar {
+            if leadingBar { ToolbarItem(placement: .topBarLeading) { leadingTabSwitch } }
             LibraryLargeTitle()
             if tab == 0 { libraryToolbar } else { settingsToolbar }
         }
@@ -3438,8 +3453,38 @@ struct LibraryView: View {
             if selected == nil, !browser, !onboarding.presented, command == "tab" { switchTab(to: 1 - tab) }
         }
     }
+    /// Wide foldable windows get the leading-side controls automatically.
+    /// env.MADEIRA_LEADING_BAR in madeira.cfg forces them on (=1) or off (=0)
+    /// on any window, so a folded cover screen needs no new build to cover.
+    private var leadingBar: Bool {
+        if let raw = MadeiraConfig.get("env.MADEIRA_LEADING_BAR") { return raw == "1" }
+        return wideWindow
+    }
+    private var barPlacement: ToolbarItemPlacement {
+        leadingBar ? .topBarLeading : .topBarTrailing
+    }
+
+    /// The two tabs, also reachable from the leading edge. The system's
+    /// floating tab bar is kept as-is for every other device; on a folded Duo
+    /// its pill sits under the system's own trailing-edge UI and goes dead.
+    private var leadingTabSwitch: some View {
+        HStack(spacing: 8) {
+            Button { switchTab(to: 0) } label: {
+                Image(systemName: "square.grid.2x2.fill").font(.system(size: 17, weight: .medium))
+            }
+            .accessibilityLabel("Library")
+            .opacity(tab == 0 ? 1 : 0.45)
+            Button { switchTab(to: 1) } label: {
+                Image(systemName: "gearshape.fill").font(.system(size: 17, weight: .medium))
+            }
+            .accessibilityLabel("Settings")
+            .opacity(tab == 1 ? 1 : 0.45)
+        }
+        .buttonStyle(.borderless)
+    }
+
     @ToolbarContentBuilder private var libraryToolbar: some ToolbarContent {
-        ToolbarItem(placement: .topBarTrailing) {
+        ToolbarItem(placement: barPlacement) {
             Menu {
                 if zoomableGrid {
                     // The new grid is sized by pinching, so the layout menu has no card sizes: one "Cards" entry
@@ -3477,10 +3522,10 @@ struct LibraryView: View {
                 }
             } label: { Label("Library options", systemImage: "line.3.horizontal.decrease") }
         }
-        ToolbarItem(placement: .topBarTrailing) { Button { browser = true } label: { Label("Add executable", systemImage: "plus") } }
+        ToolbarItem(placement: barPlacement) { Button { browser = true } label: { Label("Add executable", systemImage: "plus") } }
     }
     @ToolbarContentBuilder private var settingsToolbar: some ToolbarContent {
-        ToolbarItem(placement: .topBarTrailing) {
+        ToolbarItem(placement: barPlacement) {
             Button(action: enableJIT) {
                 HStack(spacing: 6) {
                     Text("Enable JIT")
